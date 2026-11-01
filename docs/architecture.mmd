@@ -1,0 +1,12 @@
+flowchart LR
+    AWS[(AWS Test Account<br/>IAM + S3)] -->|Boto3 read-only| COL[collector/aws_collector.py<br/>collect_aws_data]
+    SAMPLE[(data/sample_data.json)] -.fallback.-> MAIN
+    COL --> CLS[collector/classifier.py<br/>human vs non-human]
+    CLS --> MAIN{{main.py<br/>run_analysis}}
+    MAIN --> RD[analyzer/risk_detector.py<br/>detect_risks]
+    MAIN --> AV[analyzer/access_verifier.py<br/>verify_access]
+    SIM[IAM Policy Simulator] -.optional.-> AV
+    RD --> RES[(results dict)]
+    AV --> RES
+    RES --> APP[app.py<br/>Streamlit dashboard]
+    APP --> T1[Overview] & T2[Inventory] & T3[Findings] & T4[Verification] & T5[Recommendations]

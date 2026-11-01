@@ -1,0 +1,425 @@
+{
+  "identities": [
+    {
+      "name": "alice.admin",
+      "arn": "arn:aws:iam::123456789012:user/alice.admin",
+      "kind": "user",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "AdministratorAccess",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "*",
+                "Resource": "*"
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {},
+      "mfa_enabled": false,
+      "has_console_access": true,
+      "access_key_count": 1,
+      "last_used": "2026-10-01T09:00:00+00:00"
+    },
+    {
+      "name": "bob.dev",
+      "arn": "arn:aws:iam::123456789012:user/bob.dev",
+      "kind": "user",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "DevS3Full",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "s3:*",
+                "Resource": "*"
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {},
+      "mfa_enabled": true,
+      "has_console_access": true,
+      "access_key_count": 1,
+      "last_used": "2026-09-28T08:00:00+00:00"
+    },
+    {
+      "name": "carol.analyst",
+      "arn": "arn:aws:iam::123456789012:user/carol.analyst",
+      "kind": "user",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "AnalyticsRead",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:GetObject",
+                  "s3:ListBucket"
+                ],
+                "Resource": [
+                  "arn:aws:s3:::analytics-data-bucket",
+                  "arn:aws:s3:::analytics-data-bucket/*"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {},
+      "mfa_enabled": true,
+      "has_console_access": true,
+      "access_key_count": 0,
+      "last_used": "2026-09-28T08:00:00+00:00"
+    },
+    {
+      "name": "dave.old",
+      "arn": "arn:aws:iam::123456789012:user/dave.old",
+      "kind": "user",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "ReadOnly",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::build-artifacts-bucket"
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {},
+      "mfa_enabled": true,
+      "has_console_access": true,
+      "access_key_count": 0,
+      "last_used": "2025-12-01T09:00:00+00:00"
+    },
+    {
+      "name": "svc-ci-pipeline",
+      "arn": "arn:aws:iam::123456789012:user/svc-ci-pipeline",
+      "kind": "user",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "CIDeploy",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:PutObject",
+                  "s3:GetObject"
+                ],
+                "Resource": "arn:aws:s3:::build-artifacts-bucket/*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": "iam:PassRole",
+                "Resource": "*"
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {},
+      "mfa_enabled": false,
+      "has_console_access": false,
+      "access_key_count": 2,
+      "last_used": "2026-09-28T08:00:00+00:00"
+    },
+    {
+      "name": "EC2-Backup-Role",
+      "arn": "arn:aws:iam::123456789012:role/EC2-Backup-Role",
+      "kind": "role",
+      "path": "/",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "BackupAccess",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:GetObject",
+                  "s3:PutObject",
+                  "s3:ListBucket"
+                ],
+                "Resource": [
+                  "arn:aws:s3:::company-backup-bucket",
+                  "arn:aws:s3:::company-backup-bucket/*"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "ec2.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "last_used": "2026-09-20T10:00:00+00:00"
+    },
+    {
+      "name": "Lambda-Report-Role",
+      "arn": "arn:aws:iam::123456789012:role/Lambda-Report-Role",
+      "kind": "role",
+      "path": "/",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "ReportRead",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::analytics-data-bucket/*",
+                "Condition": {
+                  "StringEquals": {
+                    "aws:RequestedRegion": "ap-south-1"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "lambda.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "last_used": "2026-09-20T10:00:00+00:00"
+    },
+    {
+      "name": "CrossAccount-Audit-Role",
+      "arn": "arn:aws:iam::123456789012:role/CrossAccount-Audit-Role",
+      "kind": "role",
+      "path": "/",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "AuditRead",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:GetObject",
+                  "s3:ListBucket"
+                ],
+                "Resource": "*"
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::999999999999:root"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "last_used": "2026-09-20T10:00:00+00:00"
+    },
+    {
+      "name": "Open-Trust-Role",
+      "arn": "arn:aws:iam::123456789012:role/Open-Trust-Role",
+      "kind": "role",
+      "path": "/",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "ArtifactList",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::build-artifacts-bucket"
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "*"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "last_used": "2026-09-20T10:00:00+00:00"
+    },
+    {
+      "name": "Dev-SSO-Role",
+      "arn": "arn:aws:iam::123456789012:role/Dev-SSO-Role",
+      "kind": "role",
+      "path": "/aws-reserved/sso.amazonaws.com/",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "AnalyticsRead",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::analytics-data-bucket/*"
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Federated": "arn:aws:iam::123456789012:saml-provider/CompanyIdP"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "last_used": "2026-09-20T10:00:00+00:00"
+    },
+    {
+      "name": "Restricted-Worker-Role",
+      "arn": "arn:aws:iam::123456789012:role/Restricted-Worker-Role",
+      "kind": "role",
+      "path": "/",
+      "type": "unknown",
+      "policies": [
+        {
+          "name": "S3AllButBackup",
+          "type": "inline",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "s3:*",
+                "Resource": "*"
+              },
+              {
+                "Effect": "Deny",
+                "Action": "s3:*",
+                "Resource": [
+                  "arn:aws:s3:::company-backup-bucket",
+                  "arn:aws:s3:::company-backup-bucket/*"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::123456789012:user/svc-ci-pipeline"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      },
+      "last_used": "2026-09-20T10:00:00+00:00"
+    }
+  ],
+  "resources": [
+    {
+      "name": "company-backup-bucket",
+      "type": "s3",
+      "arn": "arn:aws:s3:::company-backup-bucket",
+      "policy": {},
+      "public_access_block": true
+    },
+    {
+      "name": "analytics-data-bucket",
+      "type": "s3",
+      "arn": "arn:aws:s3:::analytics-data-bucket",
+      "public_access_block": false,
+      "policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::analytics-data-bucket/*"
+          }
+        ]
+      }
+    },
+    {
+      "name": "build-artifacts-bucket",
+      "type": "s3",
+      "arn": "arn:aws:s3:::build-artifacts-bucket",
+      "policy": {},
+      "public_access_block": true
+    }
+  ]
+}
