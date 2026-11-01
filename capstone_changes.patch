@@ -1,0 +1,3268 @@
+diff --git a/README.md b/README.md
+index 74e00cb..76fff5d 100644
+--- a/README.md
++++ b/README.md
+@@ -43,3 +43,19 @@ Output (sorted Critical -> Low): `identity, risk, reason, resource` (required by
+ - `NotAction`/`NotResource` are handled conservatively.
+ - Escalation detection covers a curated list of known paths only; sensitive resources must be configured.
+ - Static analysis shows what is permitted on paper; the IAM Policy Simulator (Member 3) confirms real access.
++
++
++---
++# Extended pipeline (graph, multi-hop, scoring, anomaly detection, CloudTrail)
++
++```
++collector/aws_collector.py   -> raw IAM + S3 data          analyzer/schema.py      normalise legacy/canonical schema
++collector/classifier.py      -> human / non_human / uncertain analyzer/risk_detector  Member 2 rules
++collector/cloudtrail.py      -> usage evidence             analyzer/remediation.py  titles + fixes for findings
++analyzer/iam_graph.py        -> NetworkX graph, offline evaluator, multi-hop paths, role chains / cycles
++analyzer/anomaly.py          -> Node2Vec + structural features -> LOF        analyzer/scoring.py  context-aware score
++main.py (run_analysis)       -> orchestrates everything     app.py              Streamlit dashboard (7 tabs)
++```
++Run: `pip install -r requirements.txt && pytest && streamlit run app.py`
++CLI: `python main.py --sample --cloudtrail data/sample_cloudtrail.json` (or `--profile X --simulator --cloudtrail live`)
++Details: `VALIDATION.md` (bugs found in the original code), `docs/EVALUATION.md` (results and limitations).
+diff --git a/VALIDATION.md b/VALIDATION.md
+new file mode 100644
+index 0000000..d1a37a5
+--- /dev/null
++++ b/VALIDATION.md
+@@ -0,0 +1,20 @@
++# Validation report (existing code, commit 9e494a2)
++
++Baseline: `pytest` 40/40 passing (only Member 2's risk-detector tests exist at root level).
++`python main.py --sample` ran without errors but **silently produced 0 verifications**.
++
++## Bugs found and fixed
++| # | Problem | Impact | Fix |
++|---|---|---|---|
++| 1 | Two incompatible schemas: live collector emits `kind=user/role`, `type=human/non-human`, flat `policies`, bucket type `s3`; sample data / risk detector use `type=user/role`, split policy lists, `s3_bucket` | Live-AWS runs would behave differently from sample runs | `analyzer/schema.py::normalize_data` accepts both and outputs the canonical schema; called in `run_analysis` |
++| 2 | `collector/classifier.py` overwrote `identity["type"]` (user/role) with `human`/`non-human` | `select_paths` found no roles; dashboard Kind/Type wrong; classification never recomputed | Replaced with the scoring classifier that only writes `classification` and never touches `type` |
++| 3 | `select_paths` filtered `kind` and bucket type `"s3"` | 0 verification paths on sample data | Uses canonical `type`; accepts `s3`/`s3_bucket` |
++| 4 | `main.py` called `verify_access(..., use_simulator=, session=)`; real signature takes `iam_client`; passed bucket dict instead of ARN; principal type lost (Federated treated as AWS) | `TypeError` swallowed by fallback, simulator never used | Calls with `iam_client`, resource ARN string and `{"type","value"}` principal |
++| 5 | `policy_utils.identity_statements` and `app.py` read `identity["policies"]` | Empty policy view in dashboard | Read attached/inline/group lists |
++| 6 | Dashboard type filter excluded `uncertain` identities; `get_identity_kind` hard-coded sample identity names | Uncertain identities invisible; wrong labels for real data | Added `uncertain`; kind derived from trust policy/path |
++
++## Remaining issues (not fixed here)
++- Duplicate code: root-level `access_verifier.py`, `aws_collector.py`, `classifier.py`, `sample_data.json`, `test_verifier.py`, plus whole copies in `aws-identity-risk-analyzer/` and `iam_risk_member2/`. Pick `analyzer/` + `collector/` as the single source and delete the rest.
++- Offline mode (no simulator) can never reach `allowed`/`blocked` for permissions, hence all `inconclusive`. Addressed by the local evaluator in `analyzer/iam_graph.py`.
++- Verifier supports only 5 condition operators; unsupported ones yield `inconclusive`.
++- No tests for `main.py`, schema, classifier or collector.
+diff --git a/analyzer/anomaly.py b/analyzer/anomaly.py
+new file mode 100644
+index 0000000..2dd9408
+--- /dev/null
++++ b/analyzer/anomaly.py
+@@ -0,0 +1,161 @@
++"""Graph-embedding anomaly detection: Node2Vec (biased walks + skip-gram) -> Local Outlier Factor.
++
++Idea: identities whose *position in the IAM graph* differs from their peers (unusual neighbourhood,
++hub-like reach, odd privilege/connectivity mix) land far from the dense cluster in embedding space and
++get a high LOF score. This highlights identities worth a human look; it is NOT a proof of risk.
++
++Walks run on the undirected view of the graph (so sinks like buckets get context); edge weights bias
++the walks (assume edges stronger than access edges). Everything is seeded and uses a stable hash, so
++results are reproducible across runs/processes.
++"""
++from __future__ import annotations
++
++import zlib
++from typing import Dict, List, Optional
++
++import networkx as nx
++import numpy as np
++from sklearn.neighbors import LocalOutlierFactor
++from sklearn.preprocessing import StandardScaler
++
++WEIGHTS = {"assume": 2.0, "access": 1.0}
++
++
++def _stable_hash(s: str) -> int:
++    return zlib.crc32(str(s).encode())
++
++
++def _weighted_undirected(G) -> nx.Graph:
++    U = nx.Graph()
++    U.add_nodes_from(G.nodes())
++    for u, v, d in G.edges(data=True):
++        w = WEIGHTS.get(d.get("etype"), 1.0)
++        if U.has_edge(u, v):
++            U[u][v]["weight"] += w
++        else:
++            U.add_edge(u, v, weight=w)
++    return U
++
++
++def _walks(U: nx.Graph, num_walks: int, walk_length: int, p: float, q: float, seed: int) -> List[List[str]]:
++    """Node2Vec second-order biased random walks."""
++    rng = np.random.default_rng(seed)
++    nodes = sorted(U.nodes())
++    out = []
++    for _ in range(num_walks):
++        order = list(rng.permutation(nodes))
++        for start in order:
++            walk = [start]
++            while len(walk) < walk_length:
++                cur = walk[-1]
++                nbrs = sorted(U.neighbors(cur))
++                if not nbrs:
++                    break
++                if len(walk) == 1:
++                    probs = np.array([U[cur][n]["weight"] for n in nbrs], dtype=float)
++                else:
++                    prev = walk[-2]
++                    probs = np.array([
++                        U[cur][n]["weight"] * (1 / p if n == prev else 1.0 if U.has_edge(n, prev) else 1 / q)
++                        for n in nbrs], dtype=float)
++                walk.append(nbrs[int(rng.choice(len(nbrs), p=probs / probs.sum()))])
++            out.append(walk)
++    return out
++
++
++def node2vec_embeddings(G, dim: int = 32, num_walks: int = 30, walk_length: int = 12, p: float = 1.0,
++                        q: float = 2.0, window: int = 4, seed: int = 42) -> Dict[str, np.ndarray]:
++    """Return {node_id: vector}. Falls back to a spectral embedding if gensim is unavailable."""
++    U = _weighted_undirected(G)
++    try:
++        from gensim.models import Word2Vec
++        walks = _walks(U, num_walks, walk_length, p, q, seed)
++        model = Word2Vec(walks, vector_size=dim, window=window, min_count=1, sg=1, workers=1,
++                         epochs=20, seed=seed, hashfxn=_stable_hash)
++        return {n: model.wv[n] for n in U.nodes()}
++    except ImportError:                                     # pragma: no cover
++        nodes = sorted(U.nodes())
++        A = nx.to_numpy_array(U, nodelist=nodes, weight="weight")
++        u, s, _ = np.linalg.svd(A)
++        k = min(dim, len(nodes))
++        emb = u[:, :k] * np.sqrt(s[:k])
++        return {n: emb[i] for i, n in enumerate(nodes)}
++
++
++def structural_features(G) -> Dict[str, List[float]]:
++    """Interpretable features used both for explanation and (optionally) concatenated to embeddings."""
++    feats = {}
++    for n, d in G.nodes(data=True):
++        assume_in = sum(1 for _, _, e in G.in_edges(n, data=True) if e.get("etype") == "assume")
++        assume_out = sum(1 for _, _, e in G.out_edges(n, data=True) if e.get("etype") == "assume")
++        access_out = sum(1 for _, _, e in G.out_edges(n, data=True) if e.get("etype") == "access")
++        feats[n] = [assume_in, assume_out, access_out, d.get("privilege", 0),
++                    len(nx.descendants(G, n))]
++    return feats
++
++
++FEATURE_NAMES = ["assume_in", "assume_out", "access_out", "privilege", "reachable_nodes"]
++
++
++def hybrid_matrix(E, F):
++    """Concatenate standardised embeddings and structural features with *balanced* block weight
++    (each block contributes equal total variance). Evaluated best: see docs/EVALUATION.md."""
++    E, F = StandardScaler().fit_transform(E), StandardScaler().fit_transform(F)
++    return np.hstack([E / np.sqrt(E.shape[1] / F.shape[1]), F])
++
++
++def adaptive_k(X, base_k: int = 5) -> int:
++    """LOF degenerates when more than k points are identical (many IAM identities share a shape).
++    Use k larger than the biggest duplicate group so density is measured against *other* shapes."""
++    _, counts = np.unique(np.round(X, 6), axis=0, return_counts=True)
++    return int(max(2, min(len(X) - 1, max(base_k, counts.max() + 1))))
++
++
++def detect_anomalies(G, n_neighbors: int = 5, contamination: float = 0.15, use_structural: bool = True,
++                     seed: int = 42, **n2v_kwargs) -> List[dict]:
++    """LOF over identity nodes. Returns [{id,label,score(0-1),is_anomaly,lof,reasons}] sorted by score."""
++    ids = [n for n, d in G.nodes(data=True) if d.get("kind") in ("user", "role")]
++    if len(ids) < 4:
++        return []
++    emb = node2vec_embeddings(G, seed=seed, **n2v_kwargs)
++    X = np.array([emb[n] for n in ids])
++    feats = structural_features(G)
++    if use_structural:
++        X = hybrid_matrix(X, np.array([feats[n] for n in ids], dtype=float))
++    k = adaptive_k(X, n_neighbors)
++    lof = LocalOutlierFactor(n_neighbors=k, contamination=min(max(contamination, 0.01), 0.5))
++    flags = lof.fit_predict(X)
++    raw = -lof.negative_outlier_factor_                    # ~1 for inliers, >1 for outliers
++    lo, hi = raw.min(), raw.max()
++    norm = (raw - lo) / (hi - lo) if hi > lo else np.zeros_like(raw)
++
++    F_all = np.array([feats[n] for n in ids], dtype=float)
++    med = np.median(F_all, axis=0)
++    std = F_all.std(axis=0) + 1e-9
++    out = []
++    for i, n in enumerate(ids):
++        z = (F_all[i] - med) / std
++        reasons = [f"{FEATURE_NAMES[j]}={F_all[i][j]:g} (peer median {med[j]:g})"
++                   for j in np.argsort(-np.abs(z))[:2] if abs(z[j]) >= 0.75]
++        out.append({"id": n, "label": G.nodes[n]["label"], "score": round(float(norm[i]), 3),
++                    "lof": round(float(raw[i]), 3), "is_anomaly": bool(flags[i] == -1),
++                    "reasons": reasons or ["embedding neighbourhood differs from peers"]})
++    return sorted(out, key=lambda r: -r["score"])
++
++
++def anomaly_findings(G, anomalies: List[dict]) -> List[dict]:
++    res = []
++    for a in anomalies:
++        if not a["is_anomaly"]:
++            continue
++        res.append({"rule": "GRAPH_ANOMALY", "severity": "medium" if a["score"] >= 0.6 else "low",
++                    "risk": "Medium" if a["score"] >= 0.6 else "Low",
++                    "title": "Structurally unusual identity (Node2Vec+LOF)",
++                    "identity": a["label"], "identity_arn": a["id"] if a["id"].startswith("arn:") else None,
++                    "resource": None,
++                    "reason": f"Graph position differs from peers (LOF={a['lof']}, score={a['score']}): "
++                              + "; ".join(a["reasons"]),
++                    "evidence": {"lof": a["lof"], "score": a["score"]},
++                    "remediation": "Review why this identity is connected differently from its peers; "
++                                   "confirm the access is intended."})
++    return res
+diff --git a/analyzer/iam_graph.py b/analyzer/iam_graph.py
+new file mode 100644
+index 0000000..bdda6a1
+--- /dev/null
++++ b/analyzer/iam_graph.py
+@@ -0,0 +1,378 @@
++"""IAM graph construction, multi-hop access verification and role-chain detection.
++
++Graph (networkx.MultiDiGraph)
++  nodes : identities (user/role, id = ARN), resources (S3 buckets, id = ARN) and external principal
++          nodes: "service:<name>", "federated:<arn>", "external-account:<id>", "public:*"
++  edges : etype="assume"  principal -> role   (trust policy allows it AND, where AWS requires it,
++                                               the caller's own identity policy allows sts:AssumeRole)
++          etype="access"  identity/public -> bucket (identity policy or bucket policy grants actions)
++
++Everything here is OFFLINE policy evaluation (no AWS calls). It ignores SCPs, permission boundaries,
++session policies and evaluates no Condition values: a statement with a Condition is reported as
++"conditional" rather than allowed. The IAM Policy Simulator remains the ground truth.
++"""
++from __future__ import annotations
++
++import fnmatch
++from typing import Dict, Iterable, List, Optional
++
++import networkx as nx
++
++from .policy_utils import as_list, identity_statements, statements, trust_principals
++
++ALLOWED, CONDITIONAL, DENIED = "allowed", "conditional", "denied"
++S3_ACTIONS = {
++    "read": "s3:GetObject", "list": "s3:ListBucket", "write": "s3:PutObject",
++    "delete": "s3:DeleteObject", "admin": "s3:PutBucketPolicy",
++}
++ADMIN_PROBES = ["iam:CreateUser", "iam:AttachRolePolicy", "ec2:RunInstances", "s3:DeleteBucket"]
++ESCALATION_PROBES = ["iam:AttachRolePolicy", "iam:PutRolePolicy", "iam:CreatePolicyVersion",
++                     "iam:PassRole", "iam:UpdateAssumeRolePolicy"]
++MAX_HOPS = 4
++
++
++# ------------------------------------------------------------------ helpers
++def _glob(patterns, value: str) -> bool:
++    return any(fnmatch.fnmatchcase(value.lower(), str(p).lower()) for p in as_list(patterns))
++
++
++def account_of(arn: str) -> Optional[str]:
++    parts = (arn or "").split(":")
++    return parts[4] if len(parts) > 4 and parts[4] else None
++
++
++def _stmt_matches(st: dict, action: str, resource: str) -> bool:
++    if "NotAction" in st:
++        a_ok = not _glob(st["NotAction"], action)
++    else:
++        a_ok = _glob(st.get("Action"), action)
++    if "NotResource" in st:
++        r_ok = not _glob(st["NotResource"], resource)
++    else:
++        r_ok = _glob(st.get("Resource"), resource) if "Resource" in st else False
++    return a_ok and r_ok
++
++
++def evaluate(identity: dict, action: str, resource: str) -> dict:
++    """Offline identity-policy evaluation: returns {decision, evidence}."""
++    allow, deny_cond, evidence = [], [], []
++    for pname, st in identity_statements(identity):
++        if not _stmt_matches(st, action, resource):
++            continue
++        cond = bool(st.get("Condition"))
++        if st.get("Effect") == "Deny":
++            if not cond:
++                return {"decision": DENIED, "evidence": [f"Explicit Deny in '{pname}'"]}
++            deny_cond.append(pname)
++        elif st.get("Effect") == "Allow":
++            allow.append((pname, cond))
++    if not allow:
++        return {"decision": DENIED, "evidence": ["No Allow statement (implicit deny)"]}
++    unconditional = any(not c for _, c in allow)
++    evidence = [f"Allow in '{p}'" + (" (has Condition)" if c else "") for p, c in allow]
++    if deny_cond:
++        evidence.append(f"Conditional Deny in {deny_cond}")
++    decision = ALLOWED if unconditional and not deny_cond else CONDITIONAL
++    return {"decision": decision, "evidence": evidence}
++
++
++def privilege_level(identity: dict) -> int:
++    """0 none, 1 limited, 2 sensitive/escalation capable, 3 full admin (offline heuristic)."""
++    if all(evaluate(identity, a, "*")["decision"] == ALLOWED for a in ADMIN_PROBES):
++        return 3
++    if any(evaluate(identity, a, "*")["decision"] != DENIED for a in ESCALATION_PROBES):
++        return 2
++    if evaluate(identity, S3_ACTIONS["write"], "arn:aws:s3:::x/y")["decision"] != DENIED:
++        return 2
++    return 1 if list(identity_statements(identity)) else 0
++
++
++def is_sensitive(resource: dict) -> bool:
++    tags = {k.lower(): str(v).lower() for k, v in (resource.get("tags") or {}).items()}
++    return resource.get("sensitive") is True or tags.get("classification") in (
++        "confidential", "restricted", "secret", "sensitive", "pii")
++
++
++# --------------------------------------------------------------- build graph
++def _principal_node(G, kind: str, value: str) -> str:
++    if value == "*":
++        nid, attrs = "public:*", dict(kind="public", label="Anyone (*)", external=True)
++    elif kind == "Service":
++        nid, attrs = f"service:{value}", dict(kind="service", label=value, external=False)
++    elif kind == "Federated":
++        nid, attrs = f"federated:{value}", dict(kind="federated", label=value.split("/")[-1], external=False)
++    else:
++        acct = account_of(value) or value
++        nid, attrs = f"external-account:{acct}", dict(kind="external_account", label=f"Account {acct}", external=True)
++    if nid not in G:
++        G.add_node(nid, **attrs)
++    return nid
++
++
++def build_graph(data: dict) -> nx.MultiDiGraph:
++    G = nx.MultiDiGraph()
++    ids = {i["arn"]: i for i in data.get("identities", [])}
++    accounts = {account_of(a) for a in ids} | {(data.get("metadata") or {}).get("account_id")}
++    accounts.discard(None)
++
++    for arn, i in ids.items():
++        cls = (i.get("classification") or {}).get("category", "uncertain")
++        G.add_node(arn, kind=i["type"], label=i["name"], category=cls, privilege=privilege_level(i),
++                   external=False)
++    buckets = {r["arn"]: r for r in data.get("resources", []) if r.get("type") == "s3_bucket"}
++    for arn, r in buckets.items():
++        G.add_node(arn, kind="s3_bucket", label=r["name"], sensitive=is_sensitive(r), external=False)
++
++    # ---- assume edges (trust policy x caller's identity policy)
++    for role_arn, role in ids.items():
++        if role["type"] != "role":
++            continue
++        for st in statements(role.get("trust_policy")):
++            if st.get("Effect") != "Allow" or not any(
++                    a.lower() in ("sts:assumerole", "sts:*", "*") or a.lower().startswith("sts:assume")
++                    for a in as_list(st.get("Action"))):
++                continue
++            cond = st.get("Condition") or {}
++            cond_keys = sorted({k for kv in cond.values() for k in kv})
++            for kind, val in trust_principals(st):
++                common = dict(etype="assume", conditional=bool(cond), condition_keys=cond_keys)
++                caller_acct = account_of(val)
++                targets: List[tuple] = []          # (src_node, needs_identity_policy, evidence)
++                if kind == "AWS" and val in ids:
++                    needs = caller_acct != account_of(role_arn)
++                    targets.append((val, needs, f"Trust names {ids[val]['name']} explicitly"))
++                elif kind == "AWS" and val.endswith(":root") and caller_acct in accounts:
++                    for arn, i in ids.items():
++                        if account_of(arn) == caller_acct and arn != role_arn:
++                            targets.append((arn, True, "Trust delegates to account root; caller policy must allow"))
++                else:
++                    targets.append((_principal_node(G, kind, val), False,
++                                    "Trust allows an external/service principal"))
++                for src, needs, ev in targets:
++                    evidence = [ev]
++                    cond_flag = common["conditional"]
++                    if needs:
++                        res = evaluate(ids[src], "sts:AssumeRole", role_arn)
++                        evidence += [f"Caller policy: {e}" for e in res["evidence"]]
++                        if res["decision"] == DENIED:
++                            continue
++                        cond_flag = cond_flag or res["decision"] == CONDITIONAL
++                    G.add_edge(src, role_arn, **{**common, "conditional": cond_flag, "evidence": evidence})
++
++    # ---- access edges (identity policies)
++    for arn, i in ids.items():
++        for b_arn, b in buckets.items():
++            granted = {}
++            for label, act in S3_ACTIONS.items():
++                res_arn = b_arn if label in ("list", "admin") else b_arn + "/*"
++                r = evaluate(i, act, res_arn)
++                if r["decision"] != DENIED:
++                    granted[act] = {"decision": r["decision"], "evidence": r["evidence"]}
++            if granted:
++                G.add_edge(arn, b_arn, etype="access", actions=granted, via="identity_policy",
++                           conditional=all(g["decision"] == CONDITIONAL for g in granted.values()))
++
++    # ---- access edges (bucket policy: public / named principals)
++    for b_arn, b in buckets.items():
++        pab = b.get("public_access_block") or {}
++        public_blocked = bool(pab.get("RestrictPublicBuckets") or pab.get("BlockPublicPolicy"))
++        for st in statements(b.get("bucket_policy")):
++            if st.get("Effect") != "Allow":
++                continue
++            cond = bool(st.get("Condition"))
++            acts = {}
++            for label, act in S3_ACTIONS.items():
++                res_arn = b_arn if label in ("list", "admin") else b_arn + "/*"
++                if _stmt_matches(st, act, res_arn):
++                    acts[act] = {"decision": CONDITIONAL if cond else ALLOWED,
++                                 "evidence": ["Bucket policy statement" + (" (has Condition)" if cond else "")]}
++            if not acts:
++                continue
++            for kind, val in trust_principals(st):
++                if val == "*":
++                    if public_blocked:
++                        continue
++                    src = _principal_node(G, kind, "*")
++                elif val in ids:
++                    src = val
++                else:
++                    continue
++                G.add_edge(src, b_arn, etype="access", actions=acts, via="bucket_policy", conditional=cond)
++    return G
++
++
++# ---------------------------------------------------------- multi-hop search
++def _assume_hops(G, node, visited) -> Iterable[tuple]:
++    for _, dst, k, d in G.out_edges(node, keys=True, data=True):
++        if d.get("etype") == "assume" and dst not in visited:
++            yield dst, d
++
++
++def _paths_from(G, source: str, max_hops: int):
++    """DFS over assume edges; yield (node_path, [assume edge data]) incl. the zero-hop path."""
++    stack = [([source], [])]
++    while stack:
++        path, edges = stack.pop()
++        yield path, edges
++        if len(edges) >= max_hops:
++            continue
++        for dst, d in _assume_hops(G, path[-1], set(path)):
++            stack.append((path + [dst], edges + [d]))
++
++
++def find_access_paths(G, source: Optional[str] = None, target: Optional[str] = None,
++                      max_hops: int = MAX_HOPS, action: Optional[str] = None) -> List[dict]:
++    """All principal -> (assume)* -> resource paths. Zero-hop paths are direct access."""
++    sources = [source] if source else [n for n, d in G.nodes(data=True)
++                                       if d.get("kind") not in ("s3_bucket",)]
++    results = []
++    for s in sources:
++        for path, edges in _paths_from(G, s, max_hops):
++            last = path[-1]
++            for _, res, d in G.out_edges(last, data=True):
++                if d.get("etype") != "access" or (target and res != target):
++                    continue
++                if action and not _glob(list(d["actions"]), action):
++                    continue
++                conditional = d["conditional"] or any(e["conditional"] for e in edges)
++                results.append({
++                    "source": s, "source_label": G.nodes[s]["label"], "target": res,
++                    "target_label": G.nodes[res]["label"], "path": path,
++                    "path_labels": [G.nodes[n]["label"] for n in path], "hops": len(edges),
++                    "actions": sorted(d["actions"]), "via": d["via"],
++                    "status": CONDITIONAL if conditional else ALLOWED,
++                    "sensitive": G.nodes[res].get("sensitive", False),
++                    "conditions": sorted({k for e in edges for k in e["condition_keys"]}),
++                    "evidence": [x for e in edges for x in e["evidence"]]
++                                + [x for a in d["actions"].values() for x in a["evidence"]],
++                })
++    return results
++
++
++def verify_multihop(G, source: str, target: str, max_hops: int = MAX_HOPS,
++                    action: Optional[str] = None, via: Optional[str] = None) -> dict:
++    """Is there a feasible chain source -> ... -> target? Shape mirrors access_verifier.verify_access."""
++    paths = find_access_paths(G, source, target, max_hops, action)
++    if via:
++        paths = [p for p in paths if via in p["path"]]
++    base = {"principal": G.nodes[source]["label"] if source in G else source, "role": None,
++            "resource": target, "action": action or "s3:*",
++            "verification_level": "graph_offline_evaluation", "unresolved": [],
++            "disclaimer": "Offline policy evaluation (no SCP/boundary/condition evaluation). "
++                          "Confirm with the IAM Policy Simulator."}
++    if not paths:
++        return {**base, "status": "blocked", "path": [], "hops": None, "actions": [],
++                "evidence": [f"No assume/access path within {max_hops} hops"],
++                "explanation": "No feasible path found in the IAM graph."}
++    best = min(paths, key=lambda p: (p["status"] != ALLOWED, p["hops"]))
++    status = "allowed" if best["status"] == ALLOWED else "inconclusive"
++    if status == "inconclusive":
++        base["unresolved"].append(f"Path depends on Condition keys: {best['conditions'] or ['identity/bucket policy']}")
++    return {**base, "status": status, "role": best["path"][-1], "path": best["path_labels"],
++            "hops": best["hops"], "actions": best["actions"], "evidence": best["evidence"],
++            "explanation": f"{' -> '.join(best['path_labels'])} -> {best['target_label']} "
++                           f"({best['hops']} assume hop(s), via {best['via']})"}
++
++
++# ------------------------------------------------------------ role chains
++def detect_role_chains(G, min_hops: int = 2, max_hops: int = MAX_HOPS) -> List[dict]:
++    """Findings for assume-role chains (>= min_hops), privilege escalation along them, and cycles."""
++    findings, seen = [], set()
++    for s, sd in G.nodes(data=True):
++        if sd.get("kind") == "s3_bucket":
++            continue
++        for path, edges in _paths_from(G, s, max_hops):
++            if len(edges) < min_hops:
++                continue
++            key = tuple(path)
++            if key in seen:
++                continue
++            seen.add(key)
++            end = G.nodes[path[-1]]
++            start_priv, end_priv = sd.get("privilege", 0), end.get("privilege", 0)
++            accts = [account_of(n) for n in path if n.startswith("arn:")]
++            cross = len({a for a in accts if a}) > 1
++            ext_start = bool(sd.get("external"))
++            conditional = any(e["conditional"] for e in edges)
++            escalation = end_priv > start_priv
++            if end_priv == 3 and (ext_start or escalation):
++                sev = "critical" if ext_start else "high"
++            elif ext_start or (escalation and end_priv >= 2) or cross:
++                sev = "high" if ext_start else "medium"
++            else:
++                sev = "low"
++            if conditional and sev != "low":
++                sev = {"critical": "high", "high": "medium", "medium": "low"}[sev]
++            labels = [G.nodes[n]["label"] for n in path]
++            findings.append({
++                "rule": "ROLE_CHAIN", "severity": sev, "risk": sev.title(),
++                "title": f"Role chain of {len(edges)} hops ending in "
++                         f"{'admin' if end_priv == 3 else 'privileged' if end_priv == 2 else 'limited'} role",
++                "identity": sd["label"], "identity_arn": s if s.startswith("arn:") else None,
++                "resource": path[-1],
++                "reason": f"{' -> '.join(labels)}. Start privilege={start_priv}, end privilege={end_priv}"
++                          + (", crosses accounts" if cross else "")
++                          + (", starts from an external/public principal" if ext_start else "")
++                          + (", depends on Conditions" if conditional else ""),
++                "evidence": {"path": path, "hops": len(edges), "escalation": escalation,
++                             "cross_account": cross, "conditional": conditional},
++                "remediation": "Remove unnecessary sts:AssumeRole permissions or tighten the intermediate "
++                               "trust policies (specific principals, ExternalId/OrgID, MFA conditions); "
++                               "avoid chains that end in administrative roles.",
++            })
++    paths_kept = [f["evidence"]["path"] for f in findings]
++    findings = [f for f in findings if not any(
++        len(o) > len(f["evidence"]["path"]) and o[-len(f["evidence"]["path"]):] == f["evidence"]["path"]
++        for o in paths_kept)]
++    # cycles among identities
++    sub = nx.DiGraph((u, v) for u, v, d in G.edges(data=True) if d.get("etype") == "assume"
++                     and u.startswith("arn:") and v.startswith("arn:"))
++    for cyc in nx.simple_cycles(sub):
++        labels = [G.nodes[n]["label"] for n in cyc]
++        findings.append({
++            "rule": "ROLE_CYCLE", "severity": "medium", "risk": "Medium",
++            "title": "Circular role-assumption trust", "identity": labels[0], "identity_arn": cyc[0],
++            "resource": cyc[0], "reason": "Roles can assume each other in a loop: " + " -> ".join(labels + labels[:1]),
++            "evidence": {"cycle": cyc}, "conditional": False,
++            "remediation": "Break the loop: remove one of the mutual trust relationships or sts:AssumeRole grants.",
++        })
++    order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
++    return sorted(findings, key=lambda f: order[f["severity"]])
++
++
++def graph_to_dict(G) -> dict:
++    """JSON-serialisable node/edge lists (for the dashboard)."""
++    return {"nodes": [{"id": n, **{k: v for k, v in d.items()}} for n, d in G.nodes(data=True)],
++            "edges": [{"source": u, "target": v, "etype": d["etype"], "conditional": d["conditional"],
++                       "label": ", ".join(sorted(d["actions"])) if d["etype"] == "access" else "AssumeRole"}
++                      for u, v, d in G.edges(data=True)]}
++
++
++_DOT_STYLE = {"user": ("ellipse", "#cfe8ff"), "role": ("box", "#d9f2d9"), "s3_bucket": ("cylinder", "#ffe9b3"),
++              "service": ("hexagon", "#eeeeee"), "federated": ("hexagon", "#eeeeee"),
++              "external_account": ("octagon", "#ffd0d0"), "public": ("octagon", "#ff9b9b")}
++
++
++def to_dot(graph: dict, highlight: Optional[List[str]] = None) -> str:
++    """Graphviz DOT for st.graphviz_chart. `highlight` is a node-id path drawn in red."""
++    hl = set(zip(highlight or [], (highlight or [])[1:]))
++    hn = set(highlight or [])
++    lines = ["digraph G {", "rankdir=LR;", 'node [fontname="Helvetica", fontsize=10, style=filled];']
++    for n in graph["nodes"]:
++        shape, color = _DOT_STYLE.get(n.get("kind"), ("box", "#ffffff"))
++        if n.get("kind") == "s3_bucket" and n.get("sensitive"):
++            color = "#ffb347"
++        pen = ', color="#d00000", penwidth=2' if n["id"] in hn else ""
++        label = n["label"].replace('"', "'")
++        if n.get("privilege") == 3:
++            label += "\\n(admin)"
++        lines.append(f'"{n["id"]}" [label="{label}", shape={shape}, fillcolor="{color}"{pen}];')
++    for e in graph["edges"]:
++        on = (e["source"], e["target"]) in hl
++        style = "solid" if e["etype"] == "assume" else "dashed"
++        col = "#d00000" if on else ("#999999" if e["etype"] == "access" else "#333333")
++        lab = e["label"] if e["etype"] == "assume" else ""
++        lines.append(f'"{e["source"]}" -> "{e["target"]}" [style={style}, color="{col}", '
++                     f'penwidth={2.5 if on else 1}, label="{lab}", fontsize=8{", fontcolor=red" if on else ""}];')
++    lines.append("}")
++    return "\n".join(lines)
+diff --git a/analyzer/policy_utils.py b/analyzer/policy_utils.py
+index b3841ea..d4e22c3 100644
+--- a/analyzer/policy_utils.py
++++ b/analyzer/policy_utils.py
+@@ -13,7 +13,9 @@ def statements(doc):
+ 
+ def identity_statements(identity):
+     """Yield (policy_name, statement) for every statement attached to an identity."""
+-    for pol in identity.get("policies", []):
++    pols = (identity.get("attached_policies") or []) + (identity.get("inline_policies") or []) \
++        + (identity.get("group_policies") or []) + (identity.get("policies") or [])
++    for pol in pols:
+         for st in statements(pol.get("document")):
+             yield pol.get("name", "?"), st
+ 
+diff --git a/analyzer/remediation.py b/analyzer/remediation.py
+new file mode 100644
+index 0000000..551c428
+--- /dev/null
++++ b/analyzer/remediation.py
+@@ -0,0 +1,53 @@
++"""Fill in `title`, `remediation` and `identity_arn` for findings that do not carry them
++(the Member-2 risk detector emits rule/reason/evidence only)."""
++
++CATALOG = {
++    "WILDCARD_ACTION": ("Wildcard action permission",
++        "Replace '*' / 'service:*' with the specific actions the identity needs; scope Resource to exact ARNs."),
++    "ALLOW_NOT_ACTION": ("Allow with NotAction",
++        "Rewrite the statement as an explicit allow-list of actions; NotAction grants everything not listed."),
++    "UNRESTRICTED_RESOURCE": ("Actions allowed on all resources",
++        "Restrict Resource to the specific ARNs required, or add conditions (tags, source IP, org ID)."),
++    "TRUST_PUBLIC_PRINCIPAL": ("Role assumable by anyone",
++        "Replace Principal '*' with specific accounts/roles and add aws:PrincipalOrgID or sts:ExternalId conditions."),
++    "TRUST_EXTERNAL_ACCOUNT": ("Trust to an external AWS account",
++        "Require sts:ExternalId or aws:PrincipalOrgID, trust a specific role instead of the account root, "
++        "and confirm the external account is intended."),
++    "TRUST_SAME_ACCOUNT_ROOT": ("Trust delegated to whole account root",
++        "Name the specific roles/users allowed to assume this role instead of the account root."),
++    "TRUST_FEDERATED_NO_AUDIENCE": ("Federated trust without audience condition",
++        "Add an 'aud' condition on the identity provider so only the intended application can assume the role."),
++    "TRUST_FEDERATED_NO_SUBJECT": ("Federated trust without subject condition",
++        "Add a 'sub' condition (repo/branch, user or group) so only specific subjects can assume the role."),
++    "SENSITIVE_RESOURCE_ACCESS": ("Access to sensitive resource",
++        "Limit access to the minimum actions, require MFA/conditions, and review whether the identity needs it."),
++    "PRIVILEGE_ESCALATION": ("Privilege-escalation capable permissions",
++        "Remove the dangerous action combination or constrain it (specific role ARNs for iam:PassRole, "
++        "permission boundaries, no policy-write permissions)."),
++    "ATTACH_OR_PUT_POLICY": ("Can attach or write IAM policies",
++        "Remove iam:Attach*/Put* policy actions, or bound them with a permission boundary."),
++    "CREATE_POLICY_VERSION": ("Can create IAM policy versions",
++        "Remove iam:CreatePolicyVersion/SetDefaultPolicyVersion from non-admin identities."),
++    "SET_DEFAULT_POLICY_VERSION": ("Can change default policy version",
++        "Remove iam:SetDefaultPolicyVersion from non-admin identities."),
++    "UPDATE_ASSUME_ROLE_POLICY": ("Can rewrite role trust policies",
++        "Remove iam:UpdateAssumeRolePolicy; trust-policy changes should go through reviewed IaC."),
++    "PASSROLE_LAMBDA": ("PassRole + Lambda code execution",
++        "Scope iam:PassRole to specific role ARNs and restrict lambda:CreateFunction/UpdateFunctionCode."),
++    "CREDENTIAL_TAKEOVER": ("Can create credentials for other identities",
++        "Remove iam:CreateAccessKey/UpdateLoginProfile on other users (or scope to self with ${aws:username})."),
++    "POLICY_PARSE_ERROR": ("Policy could not be parsed",
++        "Fix the malformed policy document so it can be analysed."),
++}
++
++
++def enrich_findings(findings, identities):
++    by_name = {i["name"]: i["arn"] for i in identities}
++    for f in findings:
++        title, fix = CATALOG.get(f.get("rule"), (None, None))
++        f.setdefault("title", title or str(f.get("rule", "Finding")).replace("_", " ").title())
++        if not f.get("remediation"):
++            f["remediation"] = fix or "Review the finding and apply least privilege."
++        if not f.get("identity_arn"):
++            f["identity_arn"] = by_name.get(f.get("identity"))
++    return findings
+diff --git a/analyzer/schema.py b/analyzer/schema.py
+new file mode 100644
+index 0000000..c7b465a
+--- /dev/null
++++ b/analyzer/schema.py
+@@ -0,0 +1,47 @@
++"""Normalise collector output (either legacy or canonical schema) into the canonical schema.
++
++Canonical: identity.type in {user, role}; policies split into attached_policies / inline_policies /
++group_policies; resource.type == "s3_bucket"; access_keys is a list.
++Legacy collector emitted: kind=user|role, type=human|non-human|unknown, flat `policies`
++(each with type managed|inline), `access_key_count`, resource type "s3".
++"""
++import copy
++
++
++def normalize_identity(i):
++    i = dict(i)
++    kind = i.get("kind")
++    if i.get("type") not in ("user", "role"):
++        i["type"] = kind if kind in ("user", "role") else ("role" if i.get("trust_policy") else "user")
++    i["kind"] = i["type"]
++    if "policies" in i:
++        att, inl = list(i.get("attached_policies") or []), list(i.get("inline_policies") or [])
++        for p in i["policies"]:
++            if p.get("type") == "error":
++                continue
++            (inl if p.get("type") == "inline" else att).append(p)
++        i["attached_policies"], i["inline_policies"] = att, inl
++    for k in ("attached_policies", "inline_policies", "group_policies"):
++        i.setdefault(k, [])
++    if "access_keys" not in i:
++        i["access_keys"] = [{}] * int(i.get("access_key_count", 0))
++    i.setdefault("tags", {})
++    i.setdefault("path", "/")
++    return i
++
++
++def normalize_resource(r):
++    r = dict(r)
++    if r.get("type") in (None, "s3"):
++        r["type"] = "s3_bucket"
++    if not r.get("arn") and r.get("name"):
++        r["arn"] = f"arn:aws:s3:::{r['name']}"
++    r.setdefault("id", r.get("arn"))
++    return r
++
++
++def normalize_data(data):
++    data = copy.copy(data)
++    data["identities"] = [normalize_identity(i) for i in data.get("identities", [])]
++    data["resources"] = [normalize_resource(r) for r in data.get("resources", [])]
++    return data
+diff --git a/analyzer/scoring.py b/analyzer/scoring.py
+new file mode 100644
+index 0000000..4b639e0
+--- /dev/null
++++ b/analyzer/scoring.py
+@@ -0,0 +1,107 @@
++"""Context-aware risk scoring.
++
++score = clamp( severity_base + sum(context adjustments), 0, 100 ), with every adjustment recorded in
++`score_factors` so the dashboard can explain it. Context comes from the IAM graph (exposure, reach,
++sensitivity), identity metadata (MFA, key age), CloudTrail usage and the anomaly detector.
++"""
++from __future__ import annotations
++
++import math
++from datetime import datetime, timezone
++from typing import Dict, List, Optional
++
++import networkx as nx
++
++BASE = {"critical": 75, "high": 55, "medium": 35, "low": 15}
++CONTEXT_CAP = 25.0       # max points context can add on top of the severity base (diminishing returns)
++PRIORITY = [(75, "P1 - fix now"), (55, "P2 - fix this sprint"), (35, "P3 - plan"), (0, "P4 - monitor")]
++
++
++def priority_for(score: float) -> str:
++    return next(label for floor, label in PRIORITY if score >= floor)
++
++
++def _lookup(findings_identity: dict, identities: Dict[str, dict], by_name: Dict[str, dict]) -> Optional[dict]:
++    return identities.get(findings_identity.get("identity_arn") or "") or by_name.get(findings_identity.get("identity"))
++
++
++def _key_age_days(identity: dict, now: datetime) -> int:
++    ages = []
++    for k in identity.get("access_keys", []):
++        c = k.get("created")
++        if c and k.get("status", "Active") == "Active":
++            ages.append((now - datetime.fromisoformat(c)).days)
++    return max(ages, default=0)
++
++
++def score_findings(findings: List[dict], data: dict, G: Optional[nx.MultiDiGraph] = None,
++                   usage: Optional[dict] = None, anomalies: Optional[List[dict]] = None,
++                   now: Optional[datetime] = None) -> List[dict]:
++    now = now or datetime.now(timezone.utc)
++    ids = {i["arn"]: i for i in data.get("identities", [])}
++    by_name = {i["name"]: i for i in data.get("identities", [])}
++    anomaly = {a["id"]: a for a in (anomalies or [])}
++    sensitive_buckets = {n for n, d in (G.nodes(data=True) if G else []) if d.get("sensitive")}
++    n_buckets = max(1, sum(1 for _, d in (G.nodes(data=True) if G else []) if d.get("kind") == "s3_bucket"))
++    out = []
++    for f in findings:
++        sev = str(f.get("severity") or f.get("risk") or "low").lower()
++        base = float(BASE.get(sev, 15))
++        factors = [{"factor": f"base severity ({sev})", "points": base, "applied": True}]
++        raw = []
++
++        def add(points, why):
++            raw.append(points)
++            factors.append({"factor": why, "points": points, "applied": False})
++
++        ident = _lookup(f, ids, by_name)
++        arn = ident["arn"] if ident else None
++        if G is not None and arn in G:
++            anc = nx.ancestors(G, arn)
++            kinds = {G.nodes[a].get("kind") for a in anc}
++            if "public" in kinds:
++                add(+12, "assumable by anyone (public principal)")
++            elif "external_account" in kinds:
++                add(+8, "reachable from an external AWS account")
++            desc = nx.descendants(G, arn)
++            reach_sensitive = desc & sensitive_buckets
++            if reach_sensitive:
++                add(+10, f"can reach {len(reach_sensitive)} sensitive bucket(s)")
++            reach_buckets = sum(1 for d in desc if G.nodes[d].get("kind") == "s3_bucket")
++            if reach_buckets and n_buckets > 1:
++                add(round(5 * reach_buckets / n_buckets, 1), f"blast radius: {reach_buckets}/{n_buckets} buckets")
++            if G.nodes[arn].get("privilege", 0) == 3:
++                add(+8, "identity is full administrator")
++        if ident:
++            cls = (ident.get("classification") or {}).get("category")
++            if ident["type"] == "user" and ident.get("has_console_access") and not ident.get("mfa_enabled"):
++                add(+8, "console user without MFA")
++            age = _key_age_days(ident, now)
++            if age > 90:
++                add(+5, f"active access key is {age} days old")
++            if cls == "non_human" and ident.get("has_console_access"):
++                add(+5, "non-human identity with console access")
++            if cls == "uncertain":
++                add(+2, "classification uncertain (owner unknown)")
++        if usage and ident:
++            rec = usage["identities"].get(arn)
++            if rec and rec["last_seen"] and (now - rec["last_seen"]).days <= 30:
++                add(+5, "identity actively used in last 30 days (exploitable now)")
++            elif usage["window"]["days"] >= 30 and not rec:
++                add(-6, f"no activity in {usage['window']['days']} days of CloudTrail (dormant)")
++            failed = sum(r["count"] for (u, _), r in usage["failed_assume"].items() if u == arn)
++            if failed >= 3:
++                add(+5, f"{failed} denied role-assumption attempts")
++        if arn in anomaly and anomaly[arn]["is_anomaly"]:
++            add(round(10 * anomaly[arn]["score"], 1), "graph-embedding anomaly (Node2Vec+LOF)")
++        ev = f.get("evidence")
++        if isinstance(ev, dict) and ev.get("conditional"):
++            add(-10, "access depends on Condition(s)")
++        pos, neg = sum(p for p in raw if p > 0), sum(p for p in raw if p < 0)
++        bonus = CONTEXT_CAP * (1 - math.exp(-pos / CONTEXT_CAP))
++        factors.append({"factor": f"context total {pos:+g} -> {bonus:+.1f} after diminishing returns"
++                                  + (f", mitigations {neg:+g}" if neg else ""), "points": round(bonus + neg, 1),
++                        "applied": True})
++        score = max(0.0, min(100.0, round(base + bonus + neg, 1)))
++        out.append({**f, "severity": sev, "score": score, "priority": priority_for(score), "score_factors": factors})
++    return sorted(out, key=lambda x: -x["score"])
+diff --git a/analyzer/synthetic.py b/analyzer/synthetic.py
+new file mode 100644
+index 0000000..d0e97ac
+--- /dev/null
++++ b/analyzer/synthetic.py
+@@ -0,0 +1,146 @@
++"""Builders for small IAM environments (tests) and a seeded generator with injected anomalies (evaluation)."""
++from __future__ import annotations
++
++import random
++from typing import Dict, List, Optional, Sequence, Tuple
++
++ACCT = "111111111111"
++
++
++def arn_user(name, acct=ACCT):
++    return f"arn:aws:iam::{acct}:user/{name}"
++
++
++def arn_role(name, acct=ACCT):
++    return f"arn:aws:iam::{acct}:role/{name}"
++
++
++def arn_bucket(name):
++    return f"arn:aws:s3:::{name}"
++
++
++def pol(name, actions, resources, effect="Allow", condition=None, **extra):
++    st = {"Effect": effect, "Action": actions}
++    if "not_action" in extra:
++        st = {"Effect": effect, "NotAction": extra["not_action"]}
++    if "not_resource" in extra:
++        st["NotResource"] = extra["not_resource"]
++    else:
++        st["Resource"] = resources
++    if condition:
++        st["Condition"] = condition
++    return {"name": name, "document": {"Version": "2012-10-17", "Statement": [st]}}
++
++
++def bucket_pol(actions="s3:GetObject", principal="*", bucket="b", effect="Allow", condition=None):
++    st = {"Effect": effect, "Principal": principal if principal == "*" else {"AWS": principal},
++          "Action": actions, "Resource": [arn_bucket(bucket), arn_bucket(bucket) + "/*"]}
++    if condition:
++        st["Condition"] = condition
++    return {"Version": "2012-10-17", "Statement": [st]}
++
++
++def user(name, policies: Sequence[dict] = (), tags=None, console=False, mfa=False, keys=0, acct=ACCT):
++    return {"id": arn_user(name, acct), "arn": arn_user(name, acct), "name": name, "type": "user", "kind": "user",
++            "path": "/", "tags": tags or {}, "has_console_access": console, "mfa_enabled": mfa,
++            "access_keys": [{"id": f"AKIA{i}", "status": "Active", "created": "2025-01-01T00:00:00+00:00"}
++                            for i in range(keys)],
++            "attached_policies": list(policies), "inline_policies": [], "group_policies": [], "trust_policy": None}
++
++
++def trust(principals: Sequence[Tuple[str, str]], condition=None, effect="Allow"):
++    """principals: [("AWS", arn), ("Service", "lambda.amazonaws.com"), ("AWS", "*")]"""
++    stmts = []
++    for kind, val in principals:
++        st = {"Effect": effect, "Principal": {kind: val},
++              "Action": "sts:AssumeRole"}
++        if condition:
++            st["Condition"] = condition
++        stmts.append(st)
++    return {"Version": "2012-10-17", "Statement": stmts}
++
++
++def role(name, trust_policy, policies: Sequence[dict] = (), acct=ACCT, path="/", tags=None):
++    return {"id": arn_role(name, acct), "arn": arn_role(name, acct), "name": name, "type": "role", "kind": "role",
++            "path": path, "tags": tags or {}, "attached_policies": list(policies), "inline_policies": [],
++            "group_policies": [], "trust_policy": trust_policy}
++
++
++def bucket(name, sensitive=False, policy=None, pab=None):
++    return {"id": arn_bucket(name), "arn": arn_bucket(name), "name": name, "type": "s3_bucket",
++            "tags": {"Classification": "confidential"} if sensitive else {}, "bucket_policy": policy,
++            "public_access_block": pab}
++
++
++def env(identities, buckets=(), account=ACCT):
++    return {"metadata": {"account_id": account}, "identities": list(identities), "resources": list(buckets)}
++
++
++ADMIN = pol("AdministratorAccess", "*", "*")
++
++
++def assume(*role_names, acct=ACCT):
++    return pol("AssumeRoles", "sts:AssumeRole", [arn_role(r, acct) for r in role_names])
++
++
++def s3_rw(bucket_name, actions=("s3:GetObject", "s3:PutObject", "s3:ListBucket")):
++    return pol(f"S3-{bucket_name}", list(actions), [arn_bucket(bucket_name), arn_bucket(bucket_name) + "/*"])
++
++
++# ------------------------------------------------------------------ generator
++def generate_environment(seed: int = 0, n_teams: int = 6, users_per_team: int = 4,
++                         inject: Sequence[str] = ("hub", "overreach", "long_chain", "external_admin")):
++    """Teams of identical shape (users -> team role -> team bucket) plus injected anomalies.
++
++    Returns (data, anomalous_arns). Seeded; small random variation keeps teams from being identical."""
++    rnd = random.Random(seed)
++    ids: List[dict] = []
++    buckets: List[dict] = []
++    anomalies: set = set()
++    team_roles = []
++    for t in range(n_teams):
++        b, r = f"team{t}-data", f"team{t}-role"
++        buckets.append(bucket(b, sensitive=(t == 0)))
++        members = [f"u{t}_{k}" for k in range(users_per_team)]
++        ids.append(role(r, trust([("AWS", arn_user(m)) for m in members]),
++                        [s3_rw(b)]))
++        team_roles.append(r)
++        for m in members:
++            ids.append(user(m, [assume(r)], console=True, mfa=rnd.random() > 0.2))
++        if rnd.random() < 0.3:                              # benign variation: a read-only role
++            ro = f"team{t}-readonly"
++            ids.append(role(ro, trust([("AWS", arn_user(members[0]))]), [s3_rw(b, ("s3:GetObject",))]))
++            ids[[i["name"] for i in ids].index(members[0])]["attached_policies"].append(assume(ro))
++    names = {i["name"]: i for i in ids}
++
++    if "hub" in inject:                                      # role bridging many teams
++        picks = rnd.sample(range(n_teams), min(4, n_teams))
++        users = [f"u{t}_0" for t in picks]
++        ids.append(role("ops-hub", trust([("AWS", arn_user(u)) for u in users]),
++                        [assume(*[team_roles[t] for t in picks])]))
++        for u in users:
++            names[u]["attached_policies"].append(assume("ops-hub"))
++        for t in picks:
++            names[team_roles[t]]["trust_policy"]["Statement"].append(
++                {"Effect": "Allow", "Principal": {"AWS": arn_role("ops-hub")}, "Action": "sts:AssumeRole"})
++        anomalies.add(arn_role("ops-hub"))
++    if "overreach" in inject:                                # one user with access to every bucket
++        ids.append(user("u_overreach", [pol("S3All", "s3:*", [arn_bucket(b["name"]) for b in buckets]
++                                            + [arn_bucket(b["name"]) + "/*" for b in buckets])],
++                        console=True, mfa=False))
++        anomalies.add(arn_user("u_overreach"))
++    if "long_chain" in inject:                               # user -> c1 -> c2 -> c3 -> admin
++        start = f"u{rnd.randrange(n_teams)}_1"
++        chain = ["chain1", "chain2", "chain3", "chain-admin"]
++        prev_arn = arn_user(start)
++        for i, c in enumerate(chain):
++            nxt = chain[i + 1] if i + 1 < len(chain) else None
++            pols = [ADMIN] if nxt is None else [assume(nxt)]
++            ids.append(role(c, trust([("AWS", prev_arn)]), pols))
++            prev_arn = arn_role(c)
++            anomalies.add(arn_role(c))
++        names[start]["attached_policies"].append(assume("chain1"))
++    if "external_admin" in inject:                           # admin role trusted by an outside account
++        ids.append(role("vendor-admin", trust([("AWS", "arn:aws:iam::999999999999:root")]), [ADMIN]))
++        anomalies.add(arn_role("vendor-admin"))
++    return env(ids, buckets), anomalies
+diff --git a/app.py b/app.py
+index 8423ef8..479fcd5 100644
+--- a/app.py
++++ b/app.py
+@@ -1,9 +1,11 @@
+ """Streamlit dashboard.  Run:  streamlit run app.py"""
+ import json
++import tempfile
+ 
+ import pandas as pd
+ import streamlit as st
+ 
++from analyzer.iam_graph import to_dot
+ from main import SEVERITIES, STATUSES, run_analysis, summarize
+ 
+ st.set_page_config(page_title="AWS Identity Risk Analyzer", page_icon="🛡️", layout="wide")
+@@ -18,29 +20,24 @@ def get_identity_category(identity):
+     return category or "uncertain"
+ 
+ def get_identity_kind(identity):
+-    name = identity.get("name", "")
+-    identity_type = identity.get("type", "").lower()
+-    path = identity.get("path", "").lower()
+-
+-    if name == "AWSReservedSSO_PowerUser_abc123":
++    """Derive a readable kind from data (no hard-coded identity names)."""
++    t = (identity.get("type") or "").lower()
++    if t == "user":
++        return "IAM User"
++    if t != "role":
++        return "Unknown"
++    path = (identity.get("path") or "").lower()
++    kinds = {k for st in ((identity.get("trust_policy") or {}).get("Statement") or [])
++             for k in ((st.get("Principal") or {}) if isinstance(st.get("Principal"), dict) else {"AWS": "*"})}
++    if "aws-reserved/sso" in path or "AWSReservedSSO_" in identity.get("name", ""):
+         return "SSO Role"
+-
+-    if name == "CrossAccountAccess":
+-        return "Cross-account Role"
+-
+-    if name == "lambda-etl-role":
+-        return "Lambda Role"
+-
+-    if name == "svc-backup":
++    if "Service" in kinds:
+         return "Service Role"
+-
+-    if identity_type == "user":
+-        return "IAM User"
+-
+-    if identity_type == "role":
+-        return "IAM Role"
+-
+-    return "Unknown"
++    if "Federated" in kinds:
++        return "Federated Role"
++    if "AWS" in kinds:
++        return "Cross-account / Assumable Role"
++    return "IAM Role"
+ 
+ 
+ def get_policy_names(identity):
+@@ -72,11 +69,11 @@ def get_mfa_status(identity):
+ 
+ 
+ # ---------------------------------------------------------------- data loading
+-def load(use_sample, profile, simulator):
++def load(use_sample, profile, simulator, cloudtrail=None):
+     with st.spinner("Running analysis..."):
+         try:
+             st.session_state["results"] = run_analysis(use_sample=use_sample, profile=profile or None,
+-                                                       use_simulator=simulator)
++                                                       use_simulator=simulator, cloudtrail=cloudtrail)
+         except Exception as exc:  # last line of defence
+             st.session_state["results"] = {"identities": [], "resources": [], "findings": [],
+                                            "verifications": [], "source": "none",
+@@ -89,12 +86,27 @@ with st.sidebar:
+                            help="Works offline. Turn off to scan your AWS account.")
+     profile = st.text_input("AWS profile (optional)", disabled=use_sample)
+     simulator = st.checkbox("Cross-check with IAM Policy Simulator", disabled=use_sample)
++    ct_mode = st.selectbox("CloudTrail evidence", ["None", "Sample events", "Upload JSON", "Live (AWS)"],
++                           help="Adds observed-usage evidence: unused permissions, unexpected assumptions, "
++                                "denied-attempt probing, console logins without MFA.")
++    ct_arg = None
++    if ct_mode == "Sample events":
++        ct_arg = "data/sample_cloudtrail.json"
++    elif ct_mode == "Upload JSON":
++        up = st.file_uploader("CloudTrail log (.json)", type="json")
++        if up is not None:
++            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
++            tmp.write(up.getvalue())
++            tmp.close()
++            ct_arg = tmp.name
++    elif ct_mode == "Live (AWS)":
++        ct_arg = "live"
+     if st.button("▶ Run analysis", type="primary", use_container_width=True):
+-        load(use_sample, profile, simulator)
++        load(use_sample, profile, simulator, ct_arg)
+     st.caption("Credentials come from your local AWS config / environment, never from this app.")
+ 
+ if "results" not in st.session_state:
+-    load(True, "", False)
++    load(True, "", False, "data/sample_cloudtrail.json")
+ 
+ R = st.session_state["results"]
+ S = summarize(R)
+@@ -109,7 +121,8 @@ for w in R.get("warnings", []):
+     st.warning(w)
+ 
+ tabs = st.tabs(["📊 Overview", "👤 Identity Inventory", "🚨 Risk Findings",
+-                "🔍 Verification Results", "🛠️ Recommendations"])
++                "🔍 Verification Results", "🛠️ Recommendations", "🕸️ Graph & Attack Paths",
++                "🧪 Anomalies & CloudTrail"])
+ 
+ # -------------------------------------------------------------------- overview
+ with tabs[0]:
+@@ -127,6 +140,13 @@ with tabs[0]:
+     c = st.columns(3)
+     for col, s in zip(c, STATUSES):
+         col.metric(f"{STATUS_ICON[s]} {s.title()}", S["by_status"][s])
++    scored = [f for f in findings if "score" in f]
++    if scored:
++        st.subheader("Top risks by context-aware score")
++        st.dataframe(pd.DataFrame([{"Score": f["score"], "Priority": f.get("priority"),
++                                    "Severity": f.get("severity"), "Identity": f.get("identity"),
++                                    "Finding": f.get("title")} for f in scored[:8]]),
++                     use_container_width=True, hide_index=True)
+     st.download_button("⬇ Download full report (JSON)", json.dumps(R, indent=2, default=str),
+                        file_name="risk_report.json", mime="application/json")
+ 
+@@ -137,7 +157,7 @@ with tabs[1]:
+     else:
+         c1, c2 = st.columns([2, 1])
+         q = c1.text_input("🔎 Search by name or ARN")
+-        t = c2.multiselect("Type", ["human", "non-human"], default=["human", "non-human"])
++        t = c2.multiselect("Type", ["human", "non-human", "uncertain"], default=["human", "non-human", "uncertain"])
+         rows = []
+         for i in identities:
+                 rows.append({
+@@ -162,8 +182,8 @@ with tabs[1]:
+             ident = next(i for i in identities if i.get("name") == pick)
+             a, b = st.columns(2)
+             a.markdown("**Policies**")
+-            for p in ident.get("policies", []):
+-                with a.expander(f"{p.get('name')} ({p.get('type')})"):
++            for p in (ident.get("attached_policies", []) + ident.get("inline_policies", []) + ident.get("group_policies", [])):
++                with a.expander(f"{p.get('name')}"):
+                     st.json(p.get("document", {}))
+             b.markdown("**Trust policy**")
+             b.json(ident.get("trust_policy") or {"info": "N/A (IAM user)"})
+@@ -187,12 +207,15 @@ with tabs[2]:
+         c1, c2 = st.columns([2, 1])
+         q = c1.text_input("🔎 Search findings")
+         sevs = c2.multiselect("Severity", SEVERITIES, default=SEVERITIES)
+-        flt = [f for f in findings if f.get("severity") in sevs and
+-               (not q or q.lower() in json.dumps(f).lower())]
++        flt = sorted([f for f in findings if f.get("severity") in sevs and
++                      (not q or q.lower() in json.dumps(f, default=str).lower())],
++                     key=lambda f: -(f.get("score") or 0))
+         st.dataframe(
+                         pd.DataFrame([
+                             {
+                                 "ID": f.get("id"),
++                                "Score": f.get("score"),
++                                "Priority": f.get("priority"),
+                                 "Severity": f"{SEV_ICON.get(f.get('severity'), '')} {f.get('severity')}",
+                                 "Identity": f.get("identity"),
+                                 "Kind": get_identity_kind(
+@@ -216,11 +239,17 @@ with tabs[2]:
+             st.write(f"**Severity:** {f.get('severity')}  \n**Identity:** {f.get('identity')}  \n"
+                      f"**Identity ARN:** `{f.get('identity_arn') or 'n/a'}`  \n**Resource:** `{f.get('resource')}`")
+             st.write(f"**Reason:** {f.get('reason')}")
++            if f.get("score_factors"):
++                st.write(f"**Risk score:** {f['score']} / 100 — {f['priority']}")
++                with st.expander("How the score was calculated"):
++                    st.caption("Rows marked ✓ add up to the score; the others are raw signals compressed into the context total.")
++                    st.dataframe(pd.DataFrame([{"Factor": x["factor"], "Points": x["points"], "Counts toward total": "✓" if x["applied"] else ""}
++                                               for x in f["score_factors"]]), hide_index=True, use_container_width=True)
+             st.info(f"**Remediation:** {f.get('remediation')}")
+             ident = next((i for i in identities if i.get("name") == f.get("identity")), None)
+             if ident:
+                 with st.expander("Identity policies (raw)"):
+-                    st.json({"policies": ident.get("policies"), "trust_policy": ident.get("trust_policy")})
++                    st.json({"policies": ident.get("attached_policies", []) + ident.get("inline_policies", []) + ident.get("group_policies", []), "trust_policy": ident.get("trust_policy")})
+ 
+ # ---------------------------------------------------------------- verification
+ with tabs[3]:
+@@ -232,6 +261,7 @@ with tabs[3]:
+         shown = [v for v in verifs if v.get("status", "inconclusive") in sel]
+         st.dataframe(pd.DataFrame([{"Status": f"{STATUS_ICON.get(v.get('status'), '⚠️')} {v.get('status')}",
+                                     "Principal": v.get("principal"), "Role": v.get("role"),
++                                    "Hops": v.get("hops"), "Path": " → ".join(v.get("path") or []),
+                                     "Resource": v.get("resource"), "Action": v.get("action", "n/a")}
+                                    for v in shown]), use_container_width=True, hide_index=True)
+         st.subheader("Evidence")
+@@ -262,3 +292,70 @@ with tabs[4]:
+                 st.write("**Affected:** " + ", ".join(sorted(set(map(str, who)))))
+         csv = pd.DataFrame(findings).to_csv(index=False)
+         st.download_button("⬇ Download findings (CSV)", csv, file_name="findings.csv", mime="text/csv")
++
++
++# ------------------------------------------------------- graph & attack paths
++with tabs[5]:
++    graph, paths = R.get("graph"), R.get("paths", [])
++    if not graph:
++        st.info("Graph analysis did not run (see warnings).")
++    else:
++        chains = [f for f in findings if f.get("rule") in ("ROLE_CHAIN", "ROLE_CYCLE")]
++        m = st.columns(4)
++        m[0].metric("Graph nodes", len(graph["nodes"]))
++        m[1].metric("Graph edges", len(graph["edges"]))
++        m[2].metric("Multi-hop paths", sum(1 for p in paths if p["hops"] >= 2))
++        m[3].metric("Role-chain findings", len(chains))
++        st.subheader("Access paths (principal → assume* → bucket)")
++        min_hops = st.slider("Minimum assume hops", 0, 4, 1)
++        only_sens = st.checkbox("Only paths to sensitive buckets")
++        shown = [p for p in paths if p["hops"] >= min_hops and (p["sensitive"] or not only_sens)]
++        if not shown:
++            st.info("No paths match the filters.")
++        else:
++            labels = [f"{' → '.join(p['path_labels'])} → {p['target_label']}  [{p['status']}]" for p in shown]
++            pick = st.selectbox("Highlight a path", labels)
++            sel = shown[labels.index(pick)]
++            st.graphviz_chart(to_dot(graph, sel["path"] + [sel["target"]]), use_container_width=True)
++            st.write(f"**Actions:** {', '.join(sel['actions'])} · **Granted via:** {sel['via']} · "
++                     f"**Hops:** {sel['hops']}" + (f" · **Conditions:** {', '.join(sel['conditions'])}" if sel["conditions"] else ""))
++            with st.expander("Evidence"):
++                for e in sel["evidence"]:
++                    st.write(f"- {e}")
++            st.dataframe(pd.DataFrame([{"Source": p["source_label"], "Hops": p["hops"],
++                                        "Path": " → ".join(p["path_labels"]), "Target": p["target_label"],
++                                        "Actions": ", ".join(p["actions"]), "Sensitive": p["sensitive"],
++                                        "Status": p["status"]} for p in shown]),
++                         use_container_width=True, hide_index=True)
++        st.subheader("Role chains & cycles")
++        if not chains:
++            st.success("No multi-hop role chains detected.")
++        for f in chains:
++            with st.expander(f"{SEV_ICON.get(f['severity'], '')} {f['title']} — {f['identity']} (score {f.get('score', 'n/a')})"):
++                st.write(f["reason"])
++                st.info(f["remediation"])
++        with st.expander("Full graph"):
++            st.graphviz_chart(to_dot(graph), use_container_width=True)
++
++# ------------------------------------------------------ anomalies & cloudtrail
++with tabs[6]:
++    st.subheader("Graph-embedding anomalies (Node2Vec + LOF)")
++    an = R.get("anomalies", [])
++    if not an:
++        st.info("Not enough identities for anomaly detection (needs ≥ 4).")
++    else:
++        st.caption("Higher score = graph position differs more from peer identities. A lead for review, not proof of risk.")
++        st.bar_chart(pd.DataFrame({"anomaly score": {a["label"]: a["score"] for a in an}}))
++        st.dataframe(pd.DataFrame([{"Identity": a["label"], "Score": a["score"], "LOF": a["lof"],
++                                    "Flagged": a["is_anomaly"], "Why": "; ".join(a["reasons"])} for a in an]),
++                     use_container_width=True, hide_index=True)
++    st.subheader("CloudTrail evidence")
++    ct = [f for f in findings if str(f.get("rule", "")).startswith("CT_")]
++    if not R.get("cloudtrail"):
++        st.info("No CloudTrail data loaded. Choose a source in the sidebar and re-run the analysis.")
++    elif not ct:
++        st.success("CloudTrail shows no unused, unexpected or suspicious activity.")
++    for f in ct:
++        with st.expander(f"{SEV_ICON.get(f['severity'], '')} {f['title']} — {f['identity']}"):
++            st.write(f["reason"])
++            st.info(f["remediation"])
+diff --git a/collector/classifier.py b/collector/classifier.py
+index fbc6145..5fe0c89 100644
+--- a/collector/classifier.py
++++ b/collector/classifier.py
+@@ -1,38 +1,115 @@
+-"""Member 1 - human vs non-human classification (rule based, explainable)."""
++"""
++classifier.py
++Rule-based, score-driven classification of IAM identities as human / non_human / uncertain.
+ 
+-BOT_PREFIXES = ("svc-", "svc_", "bot-", "ci-", "app-", "automation-", "pipeline-")
++Each rule adds points toward 'human' or 'non_human' and records a readable signal,
++so the dashboard can show WHY an identity was classified the way it was.
++An IAM user is NOT assumed human and a role is NOT assumed non-human.
++"""
++import re
+ 
++NON_HUMAN_NAME = re.compile(
++    r"(^|[-_.])(svc|service|bot|app|ci|cd|cicd|jenkins|github|gitlab|terraform|automation|"
++    r"lambda|ec2|ecs|eks|pipeline|deploy|backup|etl|batch|cron|worker|scanner|monitor)([-_.]|$)", re.I)
++HUMAN_ROLE_NAME = re.compile(r"AWSReservedSSO_|admin-?role|breakglass|developer|engineer|analyst", re.I)
++HUMAN_TAG_VALUES = {"human", "employee", "person", "user", "staff", "contractor"}
++NON_HUMAN_TAG_VALUES = {"service", "application", "app", "automation", "bot", "workload", "machine", "ci"}
++TAG_KEYS = ("type", "identitytype", "identity-type", "identity_type", "kind", "owner-type")
+ 
+-def _trust_kinds(trust):
+-    kinds = set()
+-    for st in (trust or {}).get("Statement", []):
+-        p = st.get("Principal", {})
+-        if isinstance(p, dict):
+-            kinds.update(p.keys())
+-    return kinds
++SERVICE_PRINCIPAL_SUFFIX = ".amazonaws.com"
++CONFIDENCE_THRESHOLD = 2  # minimum score difference to commit to a category
+ 
+ 
+-def classify_one(identity):
+-    name = identity.get("name", "").lower()
+-    if identity.get("kind") == "user":
++def _principals(trust_policy):
++    """Yield (principal_kind, value) from a trust policy."""
++    for stmt in (trust_policy or {}).get("Statement", []):
++        if stmt.get("Effect") != "Allow":
++            continue
++        princ = stmt.get("Principal", {})
++        if princ == "*":
++            yield "Wildcard", "*"
++            continue
++        for kind, vals in princ.items():
++            for v in ([vals] if isinstance(vals, str) else vals):
++                yield kind, v
++
++
++def _score(identity):
++    human, non_human, signals = 0, 0, []
++
++    def add(side, pts, text):
++        nonlocal human, non_human
++        if side == "human":
++            human += pts
++        else:
++            non_human += pts
++        signals.append(f"{side}:{text}")
++
++    name, tags = identity["name"], {k.lower(): str(v).lower() for k, v in identity.get("tags", {}).items()}
++
++    # --- tags (strongest, explicit signal) ---
++    for k in TAG_KEYS:
++        v = tags.get(k)
++        if v in HUMAN_TAG_VALUES:
++            add("human", 4, f"tag {k}={v}")
++        elif v in NON_HUMAN_TAG_VALUES:
++            add("non_human", 4, f"tag {k}={v}")
++
++    # --- naming convention ---
++    if NON_HUMAN_NAME.search(name):
++        add("non_human", 2, "service-style name")
++    if re.fullmatch(r"[a-z]+[._-][a-z]+", name, re.I) and identity["type"] == "user" \
++            and not NON_HUMAN_NAME.search(name):
++        add("human", 1, "firstname.lastname-style name")
++
++    if identity["type"] == "user":
+         if identity.get("has_console_access"):
+-            return "human", "IAM user with console password"
+-        if name.startswith(BOT_PREFIXES):
+-            return "non-human", "IAM user with service-style name"
+-        if identity.get("access_key_count", 0):
+-            return "non-human", "IAM user with access keys but no console access"
+-        return "human", "IAM user (default)"
+-    kinds = _trust_kinds(identity.get("trust_policy"))
+-    if "Service" in kinds:
+-        return "non-human", "Role trusted by an AWS service"
+-    if "Federated" in kinds or "/aws-reserved/sso.amazonaws.com" in identity.get("path", ""):
+-        return "human", "Role assumed through federation / SSO"
+-    if "AWS" in kinds:
+-        return "non-human", "Role assumed by IAM principals (workload/cross-account default)"
+-    return "non-human", "Role (default)"
++            add("human", 3, "console password enabled")
++        if identity.get("mfa_enabled"):
++            add("human", 2, "MFA device attached")
++        if identity.get("access_keys") and not identity.get("has_console_access"):
++            add("non_human", 1, "access keys but no console login")
++        if not identity.get("has_console_access") and not identity.get("access_keys"):
++            signals.append("neutral:user with no credentials")
++    else:  # role
++        kinds = list(_principals(identity.get("trust_policy")))
++        if any(k == "Service" for k, _ in kinds):
++            add("non_human", 4, "trusted by AWS service principal")
++        for k, v in kinds:
++            if k != "Federated":
++                continue
++            if "saml" in str(v).lower() or "sso" in identity["path"].lower():
++                add("human", 3, "assumed via SAML/SSO federation")
++            else:
++                add("non_human", 1, "OIDC/web federation (often CI/CD)")
++            break
++        if "AWSReservedSSO_" in name or "/aws-reserved/sso.amazonaws.com/" in identity["path"]:
++            add("human", 4, "AWS IAM Identity Center (SSO) role")
++        elif HUMAN_ROLE_NAME.search(name):
++            add("human", 1, "human-style role name")
++        if any(k == "AWS" for k, _ in kinds) and not any(k in ("Service", "Federated") for k, _ in kinds):
++            signals.append("neutral:assumable by AWS principals (could be human or workload)")
++
++    return human, non_human, signals
++
++
++def classify_identity(identity):
++    human, non_human, signals = _score(identity)
++    diff = human - non_human
++    if diff >= CONFIDENCE_THRESHOLD:
++        category = "human"
++    elif -diff >= CONFIDENCE_THRESHOLD:
++        category = "non_human"
++    else:
++        category = "uncertain"
++    total = human + non_human
++    confidence = round(abs(diff) / total, 2) if total else 0.0
++    return {"category": category, "confidence": confidence,
++            "human_score": human, "non_human_score": non_human, "signals": signals,
++            "needs_review": category == "uncertain"}
+ 
+ 
+ def classify_identities(identities):
+     for ident in identities:
+-        ident["type"], ident["classification_reason"] = classify_one(ident)
++        ident["classification"] = classify_identity(ident)
+     return identities
+diff --git a/collector/cloudtrail.py b/collector/cloudtrail.py
+new file mode 100644
+index 0000000..67d81c5
+--- /dev/null
++++ b/collector/cloudtrail.py
+@@ -0,0 +1,180 @@
++"""CloudTrail integration: turn audit events into per-identity / per-edge usage evidence.
++
++Two sources:
++  * live  : fetch_cloudtrail_events(session, days)  -> uses cloudtrail:LookupEvents (management events,
++            last 90 days only; S3 *data* events are NOT available through LookupEvents)
++  * file  : load_events(path)                       -> CloudTrail log files ({"Records": [...]}) or a list
++
++summarize_usage(events) normalises them; annotate_graph() attaches the evidence to the IAM graph;
++cloudtrail_findings() produces findings (unused permissions, unexpected assumptions, failed probing,
++console login without MFA, root usage).
++"""
++from __future__ import annotations
++
++import json
++import re
++from collections import defaultdict
++from datetime import datetime, timedelta, timezone
++from typing import Dict, List, Optional
++
++ASSUMED_ROLE_RE = re.compile(r"^arn:aws:sts::(\d+):assumed-role/([^/]+)/")
++
++
++def _ts(s: str) -> datetime:
++    return datetime.fromisoformat(s.replace("Z", "+00:00"))
++
++
++# ------------------------------------------------------------------ loading
++def load_events(path: str) -> List[dict]:
++    with open(path, encoding="utf-8") as fh:
++        raw = json.load(fh)
++    return raw["Records"] if isinstance(raw, dict) else raw
++
++
++def fetch_cloudtrail_events(session, days: int = 30,
++                            event_names=("AssumeRole", "ConsoleLogin"), max_events: int = 5000) -> List[dict]:
++    """Fetch management events via LookupEvents (needs cloudtrail:LookupEvents). Failures return []."""
++    from botocore.exceptions import BotoCoreError, ClientError
++    ct = session.client("cloudtrail")
++    start = datetime.now(timezone.utc) - timedelta(days=days)
++    events: List[dict] = []
++    try:
++        for name in event_names:
++            pager = ct.get_paginator("lookup_events").paginate(
++                LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": name}], StartTime=start)
++            for page in pager:
++                for e in page.get("Events", []):
++                    events.append(json.loads(e["CloudTrailEvent"]))
++                    if len(events) >= max_events:
++                        return events
++    except (ClientError, BotoCoreError) as exc:
++        import logging
++        logging.getLogger(__name__).warning("CloudTrail lookup failed: %s", exc)
++    return events
++
++
++# ------------------------------------------------------------ normalisation
++def caller_arn(user_identity: dict) -> Optional[str]:
++    """Map a CloudTrail userIdentity to the IAM user/role ARN used as a graph node id."""
++    t = user_identity.get("type")
++    arn = user_identity.get("arn", "")
++    if t == "IAMUser":
++        return arn
++    if t == "AssumedRole":
++        m = ASSUMED_ROLE_RE.match(arn)
++        return f"arn:aws:iam::{m.group(1)}:role/{m.group(2)}" if m else None
++    if t == "AWSService":
++        return f"service:{user_identity.get('invokedBy')}"
++    if t == "Root":
++        return "root"
++    return None
++
++
++def summarize_usage(events: List[dict], window_days: Optional[int] = None) -> dict:
++    """Aggregate events. Returns {assume, failed_assume, identities, console_no_mfa, root_events, window}."""
++    assume: Dict[tuple, dict] = {}
++    failed: Dict[tuple, dict] = {}
++    ident: Dict[str, dict] = defaultdict(lambda: {"events": 0, "last_seen": None, "event_names": set(), "ips": set()})
++    console_no_mfa, root_events = [], []
++    times = []
++    for e in events:
++        t = _ts(e["eventTime"])
++        times.append(t)
++        who = caller_arn(e.get("userIdentity", {}))
++        if who:
++            r = ident[who]
++            r["events"] += 1
++            r["last_seen"] = max(filter(None, [r["last_seen"], t]))
++            r["event_names"].add(e.get("eventName"))
++            if e.get("sourceIPAddress"):
++                r["ips"].add(e["sourceIPAddress"])
++        name = e.get("eventName")
++        if name == "AssumeRole":
++            role = (e.get("requestParameters") or {}).get("roleArn")
++            if not who or not role:
++                continue
++            bucket = failed if e.get("errorCode") else assume
++            rec = bucket.setdefault((who, role), {"count": 0, "first_seen": t, "last_seen": t,
++                                                  "ips": set(), "errors": set()})
++            rec["count"] += 1
++            rec["first_seen"], rec["last_seen"] = min(rec["first_seen"], t), max(rec["last_seen"], t)
++            if e.get("sourceIPAddress"):
++                rec["ips"].add(e["sourceIPAddress"])
++            if e.get("errorCode"):
++                rec["errors"].add(e["errorCode"])
++        elif name == "ConsoleLogin" and (e.get("responseElements") or {}).get("ConsoleLogin") == "Success":
++            if (e.get("additionalEventData") or {}).get("MFAUsed") == "No":
++                console_no_mfa.append({"identity": who, "time": e["eventTime"]})
++        if who == "root":
++            root_events.append({"event": name, "time": e["eventTime"]})
++    end = max(times) if times else None
++    start = min(times) if times else None
++    return {"assume": assume, "failed_assume": failed, "identities": dict(ident),
++            "console_no_mfa": console_no_mfa, "root_events": root_events,
++            "window": {"start": start, "end": end,
++                       "days": window_days or ((end - start).days + 1 if times else 0)}}
++
++
++# --------------------------------------------------------------- graph link
++def annotate_graph(G, usage: dict) -> dict:
++    """Attach `observed` data to assume edges; return {'unused': [...], 'unexpected': [...]}."""
++    unused, unexpected = [], []
++    for u, v, d in G.edges(data=True):
++        if d.get("etype") != "assume":
++            continue
++        rec = usage["assume"].get((u, v))
++        d["observed"] = ({"count": rec["count"], "last_seen": rec["last_seen"].isoformat()} if rec else None)
++        if not rec and u.startswith("arn:"):          # only judge identity -> role edges
++            unused.append((u, v))
++    for (u, v), rec in usage["assume"].items():
++        if not G.has_edge(u, v) and u in G and v in G:
++            unexpected.append((u, v, rec))
++    return {"unused": unused, "unexpected": unexpected}
++
++
++def _label(G, n):
++    return G.nodes[n]["label"] if n in G else n.split("/")[-1]
++
++
++def cloudtrail_findings(G, usage: dict, link: dict, min_failed: int = 3) -> List[dict]:
++    out: List[dict] = []
++    days = usage["window"]["days"]
++    for u, v in link["unused"]:
++        out.append({"rule": "CT_UNUSED_ASSUME", "severity": "low", "risk": "Low",
++                    "title": "Permitted role assumption never observed",
++                    "identity": _label(G, u), "identity_arn": u, "resource": v,
++                    "reason": f"{_label(G, u)} may assume {_label(G, v)} but CloudTrail shows no use in "
++                              f"{days} day(s) of events. Unused trust is attack surface.",
++                    "evidence": {"window_days": days},
++                    "remediation": "Remove the unused trust/sts:AssumeRole grant (least privilege)."})
++    for u, v, rec in link["unexpected"]:
++        out.append({"rule": "CT_UNEXPECTED_ASSUME", "severity": "high", "risk": "High",
++                    "title": "Role assumption not explained by collected policies",
++                    "identity": _label(G, u), "identity_arn": u, "resource": v,
++                    "reason": f"CloudTrail shows {rec['count']} successful assumption(s) of {_label(G, v)} by "
++                              f"{_label(G, u)} that the graph does not allow (permission boundary, SCP, "
++                              "stale data, or missed policy source).",
++                    "evidence": {"count": rec["count"], "ips": sorted(rec["ips"])},
++                    "remediation": "Investigate the trust path; refresh collected data; confirm the assumption was authorised."})
++    for (u, v), rec in usage["failed_assume"].items():
++        if rec["count"] >= min_failed:
++            out.append({"rule": "CT_FAILED_ASSUME", "severity": "medium", "risk": "Medium",
++                        "title": "Repeated denied role-assumption attempts",
++                        "identity": _label(G, u), "identity_arn": u, "resource": v,
++                        "reason": f"{rec['count']} denied attempts ({', '.join(sorted(rec['errors']))}) by "
++                                  f"{_label(G, u)} to assume {_label(G, v)} - possible probing / misconfigured automation.",
++                        "evidence": {"count": rec["count"], "ips": sorted(rec["ips"])},
++                        "remediation": "Review the caller; rotate its credentials if the activity is unexpected."})
++    for c in usage["console_no_mfa"]:
++        out.append({"rule": "CT_CONSOLE_NO_MFA", "severity": "high", "risk": "High",
++                    "title": "Console login without MFA", "identity": _label(G, c["identity"] or "?"),
++                    "identity_arn": c["identity"], "resource": None,
++                    "reason": f"Successful console sign-in without MFA at {c['time']}.",
++                    "evidence": c, "remediation": "Enforce MFA via an IAM policy condition (aws:MultiFactorAuthPresent)."})
++    if usage["root_events"]:
++        out.append({"rule": "CT_ROOT_USAGE", "severity": "critical", "risk": "Critical",
++                    "title": "Root account activity observed", "identity": "root", "identity_arn": None,
++                    "resource": None, "reason": f"{len(usage['root_events'])} root event(s) in the window.",
++                    "evidence": usage["root_events"][:5],
++                    "remediation": "Stop using root; enable MFA on root and use IAM roles."})
++    return out
+diff --git a/data/sample_cloudtrail.json b/data/sample_cloudtrail.json
+new file mode 100644
+index 0000000..5204816
+--- /dev/null
++++ b/data/sample_cloudtrail.json
+@@ -0,0 +1,534 @@
++{
++  "Records": [
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-17T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-18T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-19T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-20T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-21T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-22T09:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "AssumedRole",
++        "arn": "arn:aws:sts::123456789012:assumed-role/DevRole/session1"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DataAdminRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-22T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-23T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-24T07:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "lambda.amazonaws.com",
++      "userIdentity": {
++        "type": "AWSService",
++        "invokedBy": "lambda.amazonaws.com"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-24T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-25T07:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "lambda.amazonaws.com",
++      "userIdentity": {
++        "type": "AWSService",
++        "invokedBy": "lambda.amazonaws.com"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-25T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-25T12:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "ConsoleLogin",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/alice.smith",
++        "userName": "alice.smith"
++      },
++      "additionalEventData": {
++        "MFAUsed": "Yes"
++      },
++      "responseElements": {
++        "ConsoleLogin": "Success"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-26T07:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "lambda.amazonaws.com",
++      "userIdentity": {
++        "type": "AWSService",
++        "invokedBy": "lambda.amazonaws.com"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-26T09:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "AssumedRole",
++        "arn": "arn:aws:sts::123456789012:assumed-role/DevRole/session1"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DataAdminRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-26T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-27T07:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "lambda.amazonaws.com",
++      "userIdentity": {
++        "type": "AWSService",
++        "invokedBy": "lambda.amazonaws.com"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-27T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-27T12:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "ConsoleLogin",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "additionalEventData": {
++        "MFAUsed": "No"
++      },
++      "responseElements": {
++        "ConsoleLogin": "Success"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-28T07:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "lambda.amazonaws.com",
++      "userIdentity": {
++        "type": "AWSService",
++        "invokedBy": "lambda.amazonaws.com"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-28T10:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "198.51.100.77",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/svc-backup",
++        "userName": "svc-backup"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DataAdminRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-28T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-29T07:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "lambda.amazonaws.com",
++      "userIdentity": {
++        "type": "AWSService",
++        "invokedBy": "lambda.amazonaws.com"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-29T09:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "AssumedRole",
++        "arn": "arn:aws:sts::123456789012:assumed-role/DevRole/session1"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DataAdminRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-29T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-30T07:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "lambda.amazonaws.com",
++      "userIdentity": {
++        "type": "AWSService",
++        "invokedBy": "lambda.amazonaws.com"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-30T07:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "198.51.100.77",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/svc-backup",
++        "userName": "svc-backup"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
++      },
++      "errorCode": "AccessDenied"
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-30T08:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "198.51.100.77",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/svc-backup",
++        "userName": "svc-backup"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
++      },
++      "errorCode": "AccessDenied"
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-30T09:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "198.51.100.77",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/svc-backup",
++        "userName": "svc-backup"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
++      },
++      "errorCode": "AccessDenied"
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-30T10:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "198.51.100.77",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/svc-backup",
++        "userName": "svc-backup"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
++      },
++      "errorCode": "AccessDenied"
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-30T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "203.0.113.10",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/bob.jones",
++        "userName": "bob.jones"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
++      }
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-30T11:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "198.51.100.77",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/svc-backup",
++        "userName": "svc-backup"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
++      },
++      "errorCode": "AccessDenied"
++    },
++    {
++      "eventVersion": "1.08",
++      "eventTime": "2026-10-30T12:00:00Z",
++      "eventSource": "sts.amazonaws.com",
++      "eventName": "AssumeRole",
++      "awsRegion": "us-east-1",
++      "sourceIPAddress": "198.51.100.77",
++      "userIdentity": {
++        "type": "IAMUser",
++        "arn": "arn:aws:iam::123456789012:user/svc-backup",
++        "userName": "svc-backup"
++      },
++      "requestParameters": {
++        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
++      },
++      "errorCode": "AccessDenied"
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/data/sample_data.json b/data/sample_data.json
+index f3ad054..390732d 100644
+--- a/data/sample_data.json
++++ b/data/sample_data.json
+@@ -407,6 +407,246 @@
+         ],
+         "needs_review": true
+       }
++    },
++    {
++      "id": "arn:aws:iam::123456789012:role/DevRole",
++      "arn": "arn:aws:iam::123456789012:role/DevRole",
++      "name": "DevRole",
++      "type": "role",
++      "path": "/",
++      "created": "2025-06-01T00:00:00+00:00",
++      "last_used": "2026-09-20T10:00:00+00:00",
++      "tags": {},
++      "max_session_duration": 3600,
++      "attached_policies": [
++        {
++          "name": "DevAssume",
++          "document": {
++            "Version": "2012-10-17",
++            "Statement": [
++              {
++                "Effect": "Allow",
++                "Action": "sts:AssumeRole",
++                "Resource": "arn:aws:iam::123456789012:role/DataAdminRole"
++              }
++            ]
++          }
++        },
++        {
++          "name": "LogsRead",
++          "document": {
++            "Version": "2012-10-17",
++            "Statement": [
++              {
++                "Effect": "Allow",
++                "Action": [
++                  "s3:GetObject",
++                  "s3:ListBucket"
++                ],
++                "Resource": [
++                  "arn:aws:s3:::internal-logs",
++                  "arn:aws:s3:::internal-logs/*"
++                ]
++              }
++            ]
++          }
++        }
++      ],
++      "inline_policies": [],
++      "group_policies": [],
++      "trust_policy": {
++        "Version": "2012-10-17",
++        "Statement": [
++          {
++            "Effect": "Allow",
++            "Principal": {
++              "AWS": "arn:aws:iam::123456789012:user/bob.jones"
++            },
++            "Action": "sts:AssumeRole"
++          }
++        ]
++      }
++    },
++    {
++      "id": "arn:aws:iam::123456789012:role/DataAdminRole",
++      "arn": "arn:aws:iam::123456789012:role/DataAdminRole",
++      "name": "DataAdminRole",
++      "type": "role",
++      "path": "/",
++      "created": "2025-06-01T00:00:00+00:00",
++      "last_used": "2026-09-20T10:00:00+00:00",
++      "tags": {},
++      "max_session_duration": 3600,
++      "attached_policies": [
++        {
++          "name": "DataAdmin",
++          "document": {
++            "Version": "2012-10-17",
++            "Statement": [
++              {
++                "Effect": "Allow",
++                "Action": [
++                  "s3:*",
++                  "iam:AttachRolePolicy"
++                ],
++                "Resource": [
++                  "arn:aws:s3:::prod-customer-data",
++                  "arn:aws:s3:::prod-customer-data/*",
++                  "*"
++                ]
++              }
++            ]
++          }
++        },
++        {
++          "name": "AssumeBreakGlass",
++          "document": {
++            "Version": "2012-10-17",
++            "Statement": [
++              {
++                "Effect": "Allow",
++                "Action": "sts:AssumeRole",
++                "Resource": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
++              }
++            ]
++          }
++        }
++      ],
++      "inline_policies": [],
++      "group_policies": [],
++      "trust_policy": {
++        "Version": "2012-10-17",
++        "Statement": [
++          {
++            "Effect": "Allow",
++            "Principal": {
++              "AWS": "arn:aws:iam::123456789012:role/DevRole"
++            },
++            "Action": "sts:AssumeRole"
++          }
++        ]
++      }
++    },
++    {
++      "id": "arn:aws:iam::123456789012:role/BreakGlassAdmin",
++      "arn": "arn:aws:iam::123456789012:role/BreakGlassAdmin",
++      "name": "BreakGlassAdmin",
++      "type": "role",
++      "path": "/",
++      "created": "2025-06-01T00:00:00+00:00",
++      "last_used": "2026-09-20T10:00:00+00:00",
++      "tags": {},
++      "max_session_duration": 3600,
++      "attached_policies": [
++        {
++          "name": "AdministratorAccess",
++          "document": {
++            "Version": "2012-10-17",
++            "Statement": [
++              {
++                "Effect": "Allow",
++                "Action": "*",
++                "Resource": "*"
++              }
++            ]
++          },
++          "arn": "arn:aws:iam::aws:policy/AdministratorAccess"
++        }
++      ],
++      "inline_policies": [],
++      "group_policies": [],
++      "trust_policy": {
++        "Version": "2012-10-17",
++        "Statement": [
++          {
++            "Effect": "Allow",
++            "Principal": {
++              "AWS": "arn:aws:iam::123456789012:role/DataAdminRole"
++            },
++            "Action": "sts:AssumeRole"
++          }
++        ]
++      }
++    },
++    {
++      "id": "arn:aws:iam::123456789012:role/RoleA",
++      "arn": "arn:aws:iam::123456789012:role/RoleA",
++      "name": "RoleA",
++      "type": "role",
++      "path": "/",
++      "created": "2025-06-01T00:00:00+00:00",
++      "last_used": "2026-09-20T10:00:00+00:00",
++      "tags": {},
++      "max_session_duration": 3600,
++      "attached_policies": [
++        {
++          "name": "AssumeB",
++          "document": {
++            "Version": "2012-10-17",
++            "Statement": [
++              {
++                "Effect": "Allow",
++                "Action": "sts:AssumeRole",
++                "Resource": "arn:aws:iam::123456789012:role/RoleB"
++              }
++            ]
++          }
++        }
++      ],
++      "inline_policies": [],
++      "group_policies": [],
++      "trust_policy": {
++        "Version": "2012-10-17",
++        "Statement": [
++          {
++            "Effect": "Allow",
++            "Principal": {
++              "AWS": "arn:aws:iam::123456789012:role/RoleB"
++            },
++            "Action": "sts:AssumeRole"
++          }
++        ]
++      }
++    },
++    {
++      "id": "arn:aws:iam::123456789012:role/RoleB",
++      "arn": "arn:aws:iam::123456789012:role/RoleB",
++      "name": "RoleB",
++      "type": "role",
++      "path": "/",
++      "created": "2025-06-01T00:00:00+00:00",
++      "last_used": "2026-09-20T10:00:00+00:00",
++      "tags": {},
++      "max_session_duration": 3600,
++      "attached_policies": [
++        {
++          "name": "AssumeA",
++          "document": {
++            "Version": "2012-10-17",
++            "Statement": [
++              {
++                "Effect": "Allow",
++                "Action": "sts:AssumeRole",
++                "Resource": "arn:aws:iam::123456789012:role/RoleA"
++              }
++            ]
++          }
++        }
++      ],
++      "inline_policies": [],
++      "group_policies": [],
++      "trust_policy": {
++        "Version": "2012-10-17",
++        "Statement": [
++          {
++            "Effect": "Allow",
++            "Principal": {
++              "AWS": "arn:aws:iam::123456789012:role/RoleA"
++            },
++            "Action": "sts:AssumeRole"
++          }
++        ]
++      }
+     }
+   ],
+   "resources": [
+diff --git a/docs/EVALUATION.md b/docs/EVALUATION.md
+new file mode 100644
+index 0000000..b948034
+--- /dev/null
++++ b/docs/EVALUATION.md
+@@ -0,0 +1,65 @@
++# Evaluation
++
++Reproduce: `python scripts/evaluate.py --seeds 30 --out /tmp/out.txt` (seeded, deterministic). Unit/integration
++tests: `pytest` (87 tests).
++
++## Raw results
++```
++A. Anomaly detection (30 seeded synthetic environments)
++| Method | ROC-AUC | Precision@k |
++|---|---|---|
++| random | 0.513 ± 0.118 | 0.186 ± 0.129 |
++| structural-only LOF | 0.872 ± 0.047 | 0.581 ± 0.036 |
++| Node2Vec+LOF | 0.695 ± 0.246 | 0.476 ± 0.248 |
++| Node2Vec+structural LOF | 0.904 ± 0.072 | 0.643 ± 0.103 |
++
++Paired AUC difference, hybrid minus structural-only: +0.031 (bootstrap 95% CI +0.000 to +0.061); hybrid wins on 67% of seeds
++
++B. Trust-evaluation agreement with independent verifier: 5550/5550 pairs (100.0%) 
++
++C. Scaling
++| Teams | Identities | Edges | build_graph | role chains | access paths | Node2Vec+LOF | chain findings | paths |
++|---|---|---|---|---|---|---|---|---|
++| 5 | 35 | 59 | 0.00s | 0.00s | 0.00s | 0.30s | 19 | 91 |
++| 20 | 112 | 183 | 0.04s | 0.00s | 0.00s | 1.36s | 19 | 290 |
++| 50 | 274 | 447 | 0.21s | 0.00s | 0.00s | 4.91s | 19 | 704 |
++| 100 | 536 | 871 | 0.93s | 0.01s | 0.01s | 12.25s | 19 | 1378 |
++```
++
++## What the numbers say
++**Anomaly detection (A).** Environments are generated by `analyzer/synthetic.py`: identical "team" stars
++(users -> team role -> team bucket) plus four injected anomalies (a hub role bridging teams, a user with access
++to every bucket, a 4-hop chain ending in admin, an admin role trusted by an external account). The task is to rank the
++injected identities above the normal ones.
++
++* **Node2Vec + LOF on embeddings alone is unreliable**: AUC 0.695 +/- 0.246 (vs 0.513 random). Variance is large, and a
++  hyper-parameter sweep (dim 8-32, 30-150 walks, q 0.5-2.0) never exceeded 0.74 AUC. Embeddings of structurally identical
++  identities differ by random-walk noise, which LOF reads as "outlier".
++* **Simple structural features (degree, privilege, reach) + LOF are a strong baseline**: AUC 0.872 +/- 0.047.
++* **Hybrid (balanced Node2Vec + structural features) scored best**: AUC 0.904 +/- 0.072, precision@k 0.643. But the paired
++  improvement over the structural-only baseline is small (+0.031, 95% bootstrap CI +0.000 to +0.061, wins 67% of seeds),
++  so **this benchmark does not show that Node2Vec clearly adds value over plain structural features**.
++  The hybrid is the shipped default (`detect_anomalies(use_structural=True)`); the embedding-only mode remains available.
++* Two bugs found while evaluating, both fixed: (1) LOF degenerates when more than `k` identities are identical, which is the
++  normal case in IAM (`adaptive_k`); (2) an unbalanced hybrid (32 embedding dims vs 5 structural) lets embedding noise dominate
++  (AUC 0.77) and a very small embedding weight breaks exact ties (AUC ~0.62-0.66), hence the variance-balanced blend.
++
++**Consistency (B).** For every (principal, role) pair in 10 generated environments, the graph's assume-edge existence
++agrees with the independent `check_trust_policy` in 5550/5550 cases. This is a *consistency* check on explicit,
++same-account trust; it does not cover root-trust, cross-account, conditions or the permissions half of a path.
++
++**Scaling (C).** Graph build, chain detection and path enumeration are cheap (< 1 s at 536 identities, hop limit 4).
++Node2Vec dominates runtime (about 12 s at 536 identities). Path enumeration is bounded by `MAX_HOPS` but is exponential in
++the worst case of very dense trust graphs.
++
++## Limitations / threats to validity
++* The anomaly benchmark is synthetic and the injected anomalies are defined structurally, i.e. in the same terms the detector
++  sees. Treat the AUC as a sanity check, not as expected real-world accuracy. No labelled real IAM data was available.
++* Offline verification evaluates identity/bucket/trust policies only. It ignores SCPs, permission boundaries, session
++  policies, resource policies other than S3 bucket policies, KMS, VPC endpoints, and does not evaluate Condition values
++  (statements with a Condition are reported `conditional` / `inconclusive`). It was **not** compared with the AWS IAM Policy
++  Simulator because no AWS credentials were available in the build environment; use `--simulator` against the test account to
++  cross-check.
++* CloudTrail `LookupEvents` covers management events for the last 90 days only (no S3 data events). The live path was not run
++  against a real account; parsing is tested on generated events in the standard CloudTrail record format.
++* The classifier and risk scorer weights are heuristic and untuned on real data.
+diff --git a/main.py b/main.py
+index 2a253bc..90b6a40 100644
+--- a/main.py
++++ b/main.py
+@@ -9,6 +9,8 @@ import logging
+ from collections import Counter
+ from pathlib import Path
+ 
++from analyzer.policy_utils import trust_principals
++
+ log = logging.getLogger("analyzer")
+ SAMPLE_PATH = Path(__file__).parent / "data" / "sample_data.json"
+ SEVERITIES = ["critical", "high", "medium", "low"]
+@@ -25,16 +27,15 @@ def load_sample():
+ def select_paths(data):
+     """Yield (role, principal, bucket, action): every trusted principal x S3 bucket."""
+     n = 0
+-    buckets = [r for r in data.get("resources", []) if r.get("type") == "s3"]
++    buckets = [r for r in data.get("resources", []) if r.get("type") in ("s3", "s3_bucket")]
+     for ident in data.get("identities", []):
+-        if ident.get("kind", "role") != "role":
++        if (ident.get("type") or ident.get("kind")) != "role":
+             continue
+         principals = []
+         for st in (ident.get("trust_policy") or {}).get("Statement", []):
+             if st.get("Effect") != "Allow":
+                 continue
+-            from analyzer.policy_utils import trust_principals
+-            principals += [v for _, v in trust_principals(st)]
++            principals += [(k, v) for k, v in trust_principals(st)]
+         for pr in dict.fromkeys(principals):
+             for b in buckets:
+                 for act in TEST_ACTIONS:
+@@ -44,7 +45,39 @@ def select_paths(data):
+                     yield ident, pr, b, act
+ 
+ 
+-def run_analysis(use_sample=False, profile=None, use_simulator=False):
++def load_cloudtrail(cloudtrail, source, profile, days):
++    """cloudtrail: None | path to CloudTrail JSON | 'live' (LookupEvents, AWS source only)."""
++    if not cloudtrail:
++        return []
++    from collector.cloudtrail import fetch_cloudtrail_events, load_events
++    if cloudtrail == "live":
++        if source != "aws":
++            return []
++        import boto3
++        return fetch_cloudtrail_events(boto3.Session(profile_name=profile), days)
++    return load_events(cloudtrail)
++
++
++def offline_verifications(G, data):
++    """Graph-based (offline) verification: every direct trusted principal x bucket x TEST_ACTIONS,
++    following multi-hop assume chains. Conclusive without the IAM Policy Simulator."""
++    from analyzer.iam_graph import verify_multihop
++    out = []
++    buckets = [n for n, d in G.nodes(data=True) if d.get("kind") == "s3_bucket"]
++    for role in [n for n, d in G.nodes(data=True) if d.get("kind") == "role"]:
++        srcs = {u for u, _, d in G.in_edges(role, data=True) if d.get("etype") == "assume"}
++        for src in sorted(srcs):
++            for b in buckets:
++                for act in TEST_ACTIONS:
++                    if len(out) >= MAX_PATHS:
++                        return out
++                    v = verify_multihop(G, src, b, action=act, via=role)
++                    v["role"] = role
++                    out.append(v)
++    return out
++
++
++def run_analysis(use_sample=False, profile=None, use_simulator=False, cloudtrail=None, ct_days=30):
+     """Always returns a dict with identities, resources, findings, verifications, source, warnings."""
+     warnings, source = [], "sample" if use_sample else "aws"
+     try:
+@@ -58,8 +91,8 @@ def run_analysis(use_sample=False, profile=None, use_simulator=False):
+         warnings.append(f"AWS collection failed ({type(exc).__name__}: {exc}). Showing sample data instead.")
+         data, source = load_sample(), "sample"
+ 
+-    data.setdefault("identities", [])
+-    data.setdefault("resources", [])
++    from analyzer.schema import normalize_data
++    data = normalize_data(data)
+ 
+     try:
+         from collector.classifier import classify_identities
+@@ -67,7 +100,7 @@ def run_analysis(use_sample=False, profile=None, use_simulator=False):
+     except Exception as exc:
+         warnings.append(f"Classification failed: {exc}")
+ 
+-    findings, verifications = [], []
++    findings, verifications, graph, paths = [], [], None, []
+     try:
+         from analyzer.risk_detector import detect_risks
+         findings = detect_risks(data)
+@@ -75,25 +108,70 @@ def run_analysis(use_sample=False, profile=None, use_simulator=False):
+         log.exception("Risk detection failed")
+         warnings.append(f"Risk detection failed: {exc}")
+ 
++    from analyzer.remediation import enrich_findings
++    findings = enrich_findings(findings, data["identities"])
++
++    G = None
++    try:
++        from analyzer.iam_graph import build_graph, detect_role_chains, find_access_paths, graph_to_dict
++        G = build_graph(data)
++        paths = sorted(find_access_paths(G), key=lambda p: (-p["hops"], p["source_label"]))[:300]
++        findings = findings + detect_role_chains(G)
++        graph = graph_to_dict(G)
++    except Exception as exc:
++        log.exception("Graph analysis failed")
++        warnings.append(f"Graph analysis failed: {exc}")
++
+     try:
+         from analyzer.access_verifier import verify_access
+-        session = None
++        iam_client = None
+         if use_simulator and source == "aws":
+             import boto3
+-            session = boto3.Session(profile_name=profile)
+-        for ident, principal, bucket, action in select_paths(data):
+-            try:
+-                verifications.append(verify_access(ident, principal, bucket, action=action,
+-                                                   use_simulator=use_simulator and source == "aws",
+-                                                   session=session))
+-            except TypeError:  # teammate's verify_access has the 3-arg signature
+-                verifications.append(verify_access(ident, principal, bucket))
++            iam_client = boto3.Session(profile_name=profile).client("iam")
++        if not (use_simulator and source == "aws") and G is not None:
++            verifications = offline_verifications(G, data)
++        else:
++            for ident, (kind, value), bucket, action in select_paths(data):
++                resource = bucket.get("arn") or f"arn:aws:s3:::{bucket['name']}"
++                if action.startswith(("s3:GetObject", "s3:PutObject")):
++                    resource += "/*"
++                verifications.append(verify_access(ident, {"type": kind, "value": value}, resource,
++                                                   action=action, iam_client=iam_client))
+     except Exception as exc:
+         log.exception("Verification failed")
+         warnings.append(f"Access verification failed: {exc}")
+ 
++    usage, anomalies = None, []
++    if G is not None:
++        try:
++            from analyzer.anomaly import anomaly_findings, detect_anomalies
++            anomalies = detect_anomalies(G)
++            findings += anomaly_findings(G, anomalies)
++        except Exception as exc:
++            log.exception("Anomaly detection failed")
++            warnings.append(f"Anomaly detection failed: {exc}")
++        try:
++            events = load_cloudtrail(cloudtrail, source, profile, ct_days)
++            if events:
++                from collector.cloudtrail import annotate_graph, cloudtrail_findings, summarize_usage
++                usage = summarize_usage(events)
++                findings += cloudtrail_findings(G, usage, annotate_graph(G, usage))
++                graph = graph_to_dict(G)
++        except Exception as exc:
++            log.exception("CloudTrail integration failed")
++            warnings.append(f"CloudTrail integration failed: {exc}")
++        try:
++            from analyzer.scoring import score_findings
++            findings = score_findings(findings, data, G, usage, anomalies)
++        except Exception as exc:
++            log.exception("Scoring failed")
++            warnings.append(f"Risk scoring failed: {exc}")
++
++    for n, f in enumerate(findings, 1):
++        f.setdefault("id", f"F-{n:03d}")
+     return {"identities": data["identities"], "resources": data["resources"],
+-            "findings": findings, "verifications": verifications,
++            "findings": findings, "verifications": verifications, "graph": graph, "paths": paths,
++            "anomalies": anomalies, "cloudtrail": bool(usage),
+             "source": source, "warnings": warnings}
+ 
+ def summarize(R):
+@@ -152,8 +230,11 @@ if __name__ == "__main__":
+     ap.add_argument("--sample", action="store_true")
+     ap.add_argument("--profile")
+     ap.add_argument("--simulator", action="store_true")
++    ap.add_argument("--cloudtrail", help="CloudTrail JSON file, or 'live' to query AWS")
++    ap.add_argument("--days", type=int, default=30)
+     a = ap.parse_args()
+-    res = run_analysis(use_sample=a.sample, profile=a.profile, use_simulator=a.simulator)
++    res = run_analysis(use_sample=a.sample, profile=a.profile, use_simulator=a.simulator,
++                       cloudtrail=a.cloudtrail, ct_days=a.days)
+     print(json.dumps(summarize(res), indent=2))
+     for w in res["warnings"]:
+         print("WARNING:", w)
+diff --git a/requirements.txt b/requirements.txt
+index b197d32..ee7b930 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1 +1,8 @@
++boto3>=1.34
++streamlit>=1.40
++pandas>=2.0
++networkx>=3.0
++numpy>=1.26
++scikit-learn>=1.3
++gensim>=4.3
+ pytest>=7.0
+diff --git a/scripts/evaluate.py b/scripts/evaluate.py
+new file mode 100644
+index 0000000..89de5fe
+--- /dev/null
++++ b/scripts/evaluate.py
+@@ -0,0 +1,118 @@
++"""Evaluation harness. Usage: python scripts/evaluate.py [--seeds 30] [--out docs/EVALUATION.md]
++
++A. Anomaly detection: Node2Vec+LOF vs baselines on synthetic IAM environments with injected anomalies.
++B. Consistency: graph trust logic vs the independent access_verifier.check_trust_policy.
++C. Scaling: wall-clock time of the pipeline stages as the environment grows.
++"""
++import argparse
++import random
++import statistics as st
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++from sklearn.metrics import roc_auc_score
++from sklearn.neighbors import LocalOutlierFactor
++from sklearn.preprocessing import StandardScaler
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++from analyzer import synthetic as S                                          # noqa: E402
++from analyzer.access_verifier import check_trust_policy                      # noqa: E402
++from analyzer.anomaly import FEATURE_NAMES, adaptive_k, detect_anomalies, hybrid_matrix, node2vec_embeddings, structural_features  # noqa: E402
++from analyzer.iam_graph import build_graph, detect_role_chains, find_access_paths  # noqa: E402
++
++
++def lof_scores(X, k=5):
++    k = adaptive_k(X, k)
++    return -LocalOutlierFactor(n_neighbors=k).fit(X).negative_outlier_factor_
++
++
++def precision_at_k(y, s, k):
++    top = np.argsort(-np.asarray(s))[:k]
++    return float(np.mean(np.asarray(y)[top]))
++
++
++def part_a(n_seeds):
++    methods = {"random": [], "structural-only LOF": [], "Node2Vec+LOF": [], "Node2Vec+structural LOF": []}
++    methods_paired = []
++    for seed in range(n_seeds):
++        rnd = random.Random(seed)
++        data, injected = S.generate_environment(seed=seed, n_teams=rnd.randint(5, 9),
++                                                users_per_team=rnd.randint(3, 5))
++        G = build_graph(data)
++        ids = [n for n, d in G.nodes(data=True) if d.get("kind") in ("user", "role")]
++        y = [int(n in injected) for n in ids]
++        feats = structural_features(G)
++        F = StandardScaler().fit_transform(np.array([feats[n] for n in ids], dtype=float))
++        emb = node2vec_embeddings(G, seed=seed)
++        E = np.array([emb[n] for n in ids])
++        scores = {"random": np.random.default_rng(seed).random(len(ids)),
++                  "structural-only LOF": lof_scores(F),
++                  "Node2Vec+LOF": lof_scores(E),
++                  "Node2Vec+structural LOF": lof_scores(hybrid_matrix(E, np.array([feats[n] for n in ids], dtype=float)))}
++        for m, sc in scores.items():
++            methods[m].append((roc_auc_score(y, sc), precision_at_k(y, sc, sum(y))))
++    d = np.array([h[0] - s_[0] for h, s_ in zip(methods["Node2Vec+structural LOF"], methods["structural-only LOF"])])
++    boot = np.random.default_rng(0).choice(d, (5000, len(d))).mean(axis=1)
++    paired = (d.mean(), np.percentile(boot, 2.5), np.percentile(boot, 97.5), float((d > 0).mean()))
++    return paired, {m: (np.mean([a for a, _ in v]), np.std([a for a, _ in v]),
++                np.mean([p for _, p in v]), np.std([p for _, p in v])) for m, v in methods.items()}
++
++
++def part_b(n_seeds=10):
++    agree = total = 0
++    mismatches = []
++    for seed in range(n_seeds):
++        data, _ = S.generate_environment(seed=seed)
++        G = build_graph(data)
++        ids = {i["arn"]: i for i in data["identities"]}
++        for r_arn, r in ids.items():
++            if r["type"] != "role":
++                continue
++            for p_arn in ids:
++                if p_arn == r_arn:
++                    continue
++                legacy = check_trust_policy(r["trust_policy"], p_arn)["status"] == "allowed"
++                new = G.has_edge(p_arn, r_arn) or (not legacy and False)
++                # graph edges for explicit principals depend on trust only (same account) -> must agree
++                total += 1
++                agree += (legacy == new)
++                if legacy != new and len(mismatches) < 3:
++                    mismatches.append((p_arn, r_arn, legacy, new))
++    return agree, total, mismatches
++
++
++def part_c(sizes=(5, 20, 50, 100)):
++    rows = []
++    for n in sizes:
++        data, _ = S.generate_environment(seed=1, n_teams=n, users_per_team=4)
++        t0 = time.perf_counter(); G = build_graph(data); t1 = time.perf_counter()
++        chains = detect_role_chains(G); t2 = time.perf_counter()
++        paths = find_access_paths(G); t3 = time.perf_counter()
++        detect_anomalies(G); t4 = time.perf_counter()
++        rows.append((n, len(data["identities"]), G.number_of_edges(), t1 - t0, t2 - t1, t3 - t2, t4 - t3,
++                     len(chains), len(paths)))
++    return rows
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--seeds", type=int, default=30)
++    ap.add_argument("--out")
++    a = ap.parse_args()
++    (paired, A), (ag, tot, mm), C = part_a(a.seeds), part_b(), part_c()
++    lines = ["| Method | ROC-AUC | Precision@k |", "|---|---|---|"]
++    lines += [f"| {m} | {x[0]:.3f} ± {x[1]:.3f} | {x[2]:.3f} ± {x[3]:.3f} |" for m, x in A.items()]
++    lines.append("")
++    lines.append(f"Paired AUC difference, hybrid minus structural-only: {paired[0]:+.3f} "
++                 f"(bootstrap 95% CI {paired[1]:+.3f} to {paired[2]:+.3f}); hybrid wins on {100*paired[3]:.0f}% of seeds")
++    t = ["| Teams | Identities | Edges | build_graph | role chains | access paths | Node2Vec+LOF | chain findings | paths |",
++         "|---|---|---|---|---|---|---|---|---|"]
++    t += [f"| {r[0]} | {r[1]} | {r[2]} | {r[3]:.2f}s | {r[4]:.2f}s | {r[5]:.2f}s | {r[6]:.2f}s | {r[7]} | {r[8]} |" for r in C]
++    out = "\n".join(["A. Anomaly detection (%d seeded synthetic environments)" % a.seeds, *lines, "",
++                     f"B. Trust-evaluation agreement with independent verifier: {ag}/{tot} pairs "
++                     f"({100*ag/tot:.1f}%) {mm if mm else ''}", "", "C. Scaling", *t])
++    print(out)
++    if a.out:
++        Path(a.out).write_text(out)
+diff --git a/scripts/gen_sample_cloudtrail.py b/scripts/gen_sample_cloudtrail.py
+new file mode 100644
+index 0000000..c7f56e3
+--- /dev/null
++++ b/scripts/gen_sample_cloudtrail.py
+@@ -0,0 +1,39 @@
++"""Generate deterministic sample CloudTrail events matching data/sample_data.json."""
++import json
++from datetime import datetime, timedelta, timezone
++
++A = "123456789012"
++NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
++ev = []
++
++def add(days_ago, hour, name, ident, ip="203.0.113.10", params=None, err=None, extra=None, resp=None):
++    t = NOW - timedelta(days=days_ago, hours=hour)
++    e = {"eventVersion": "1.08", "eventTime": t.strftime("%Y-%m-%dT%H:%M:%SZ"), "eventSource": "sts.amazonaws.com",
++         "eventName": name, "awsRegion": "us-east-1", "sourceIPAddress": ip, "userIdentity": ident}
++    if params: e["requestParameters"] = params
++    if err: e["errorCode"] = err
++    if extra: e["additionalEventData"] = extra
++    if resp: e["responseElements"] = resp
++    ev.append(e)
++
++user = lambda n: {"type": "IAMUser", "arn": f"arn:aws:iam::{A}:user/{n}", "userName": n}
++assumed = lambda r: {"type": "AssumedRole", "arn": f"arn:aws:sts::{A}:assumed-role/{r}/session1"}
++role = lambda r: f"arn:aws:iam::{A}:role/{r}"
++
++for d in range(1, 15):                                   # bob -> DevRole daily
++    add(d, 1, "AssumeRole", user("bob.jones"), params={"roleArn": role("DevRole")})
++for d in (2, 5, 9):                                      # DevRole -> DataAdminRole occasionally
++    add(d, 3, "AssumeRole", assumed("DevRole"), params={"roleArn": role("DataAdminRole")})
++for d in range(1, 8):                                    # lambda service assumes its role
++    add(d, 5, "AssumeRole", {"type": "AWSService", "invokedBy": "lambda.amazonaws.com"},
++        params={"roleArn": role("lambda-etl-role")}, ip="lambda.amazonaws.com")
++for h in range(6):                                       # svc-backup probing the break-glass admin
++    add(1, h, "AssumeRole", user("svc-backup"), ip="198.51.100.77",
++        params={"roleArn": role("BreakGlassAdmin")}, err="AccessDenied")
++add(3, 2, "AssumeRole", user("svc-backup"), ip="198.51.100.77",     # successful but NOT explained by policies
++    params={"roleArn": role("DataAdminRole")})
++add(4, 0, "ConsoleLogin", user("bob.jones"), extra={"MFAUsed": "No"}, resp={"ConsoleLogin": "Success"})
++add(6, 0, "ConsoleLogin", user("alice.smith"), extra={"MFAUsed": "Yes"}, resp={"ConsoleLogin": "Success"})
++ev.sort(key=lambda e: e["eventTime"])
++json.dump({"Records": ev}, open("data/sample_cloudtrail.json", "w"), indent=2)
++print(len(ev), "events")
+diff --git a/tests/test_anomaly_scoring_pipeline.py b/tests/test_anomaly_scoring_pipeline.py
+new file mode 100644
+index 0000000..4f6d7a7
+--- /dev/null
++++ b/tests/test_anomaly_scoring_pipeline.py
+@@ -0,0 +1,127 @@
++import json
++from datetime import datetime, timezone
++
++import pytest
++
++import main
++from analyzer import synthetic as S
++from analyzer.anomaly import detect_anomalies, node2vec_embeddings
++from analyzer.iam_graph import build_graph
++from analyzer.scoring import BASE, score_findings
++
++
++# ------------------------------------------------------------------ anomaly
++def test_anomaly_needs_enough_identities():
++    G = build_graph(S.env([S.user("a"), S.user("b")]))
++    assert detect_anomalies(G) == []
++
++
++def test_embeddings_are_deterministic_across_calls():
++    data, _ = S.generate_environment(seed=1)
++    G = build_graph(data)
++    a, b = node2vec_embeddings(G), node2vec_embeddings(G)
++    assert all((a[n] == b[n]).all() for n in a)
++
++
++def test_anomaly_scores_are_normalised_and_sorted():
++    data, _ = S.generate_environment(seed=1)
++    out = detect_anomalies(build_graph(data))
++    scores = [o["score"] for o in out]
++    assert scores == sorted(scores, reverse=True) and 0 <= min(scores) and max(scores) == 1.0
++    assert all(o["reasons"] for o in out)
++
++
++def test_injected_structures_rank_above_typical_identity():
++    data, injected = S.generate_environment(seed=3)
++    out = detect_anomalies(build_graph(data), use_structural=True)
++    rank = {o["id"]: i for i, o in enumerate(out)}
++    median_rank = sorted(rank[a] for a in injected)[len(injected) // 2]
++    assert median_rank < len(out) / 2                       # injected anomalies concentrate in the top half
++
++
++# ------------------------------------------------------------------ scoring
++def finding(identity_arn, name, sev="high", **kw):
++    return {"rule": "X", "severity": sev, "identity": name, "identity_arn": identity_arn, "resource": None, **kw}
++
++
++NOW = datetime(2026, 11, 1, tzinfo=timezone.utc)
++
++
++def test_context_raises_score_for_exposed_identity():
++    data = S.env([S.role("pub", S.trust([("AWS", "*")]), [S.s3_rw("b")]),
++                  S.role("priv", S.trust([("AWS", S.arn_user("u"))]), [S.s3_rw("b")]), S.user("u")],
++                 [S.bucket("b", sensitive=True)])
++    G = build_graph(data)
++    fs = score_findings([finding(S.arn_role("pub"), "pub"), finding(S.arn_role("priv"), "priv")], data, G, now=NOW)
++    sc = {f["identity"]: f["score"] for f in fs}
++    assert sc["pub"] > sc["priv"] >= BASE["high"]
++
++
++def test_scores_bounded_and_factors_explain_total():
++    data = S.env([S.role("pub", S.trust([("AWS", "*")]), [S.ADMIN]), S.user("x"), S.user("y"), S.user("z")],
++                 [S.bucket("b", sensitive=True), S.bucket("c")])
++    G = build_graph(data)
++    for sev in BASE:
++        f = score_findings([finding(S.arn_role("pub"), "pub", sev)], data, G, now=NOW)[0]
++        assert 0 <= f["score"] <= 100
++        assert sum(x["points"] for x in f["score_factors"] if x["applied"]) == pytest.approx(f["score"], abs=0.11)
++
++
++def test_severity_tiers_preserved_without_context():
++    data = S.env([S.user("u")])
++    fs = score_findings([finding(None, "u", s) for s in ("low", "medium", "high", "critical")], data, None, now=NOW)
++    assert [f["severity"] for f in fs] == ["critical", "high", "medium", "low"]
++
++
++def test_condition_and_dormancy_lower_score():
++    data = S.env([S.user("u")])
++    base = score_findings([finding(None, "u")], data, None, now=NOW)[0]["score"]
++    cond = score_findings([finding(None, "u", evidence={"conditional": True})], data, None, now=NOW)[0]["score"]
++    assert cond < base
++
++
++def test_missing_severity_key_uses_risk_field():
++    f = score_findings([{"rule": "X", "risk": "Critical", "identity": "u"}], S.env([S.user("u")]), None, now=NOW)[0]
++    assert f["severity"] == "critical" and f["score"] >= BASE["critical"]
++
++
++# ----------------------------------------------------------------- pipeline
++@pytest.fixture(scope="module")
++def result():
++    return main.run_analysis(use_sample=True, cloudtrail="data/sample_cloudtrail.json")
++
++
++def test_pipeline_has_no_warnings_and_produces_everything(result):
++    assert result["warnings"] == []
++    for k in ("identities", "findings", "verifications", "graph", "paths", "anomalies"):
++        assert result[k], k
++    assert result["cloudtrail"] is True
++
++
++def test_pipeline_finds_the_planted_scenarios(result):
++    rules = {f["rule"] for f in result["findings"]}
++    assert {"ROLE_CHAIN", "ROLE_CYCLE", "CT_UNEXPECTED_ASSUME", "CT_FAILED_ASSUME", "CT_CONSOLE_NO_MFA",
++            "TRUST_PUBLIC_PRINCIPAL", "GRAPH_ANOMALY"} <= rules
++    assert any(v["hops"] == 2 and v["status"] == "allowed" for v in result["verifications"] if v.get("hops"))
++
++
++def test_every_finding_is_dashboard_ready_and_unique(result):
++    fs = result["findings"]
++    assert len({f["id"] for f in fs}) == len(fs)
++    assert all(f.get("title") and f.get("remediation") and 0 <= f["score"] <= 100 and f["priority"] for f in fs)
++    assert [f["score"] for f in fs] == sorted((f["score"] for f in fs), reverse=True)
++
++
++def test_verifications_are_conclusive_offline(result):
++    assert all(v["status"] in ("allowed", "blocked") for v in result["verifications"])
++
++
++def test_result_is_json_serialisable(result):
++    json.dumps(result, default=str)
++
++
++def test_pipeline_survives_without_cloudtrail_and_is_deterministic():
++    a = main.run_analysis(use_sample=True)
++    b = main.run_analysis(use_sample=True)
++    assert a["warnings"] == [] and not a["cloudtrail"]
++    assert [(f["id"], f["score"]) for f in a["findings"]] == [(f["id"], f["score"]) for f in b["findings"]]
+diff --git a/tests/test_cloudtrail.py b/tests/test_cloudtrail.py
+new file mode 100644
+index 0000000..195130b
+--- /dev/null
++++ b/tests/test_cloudtrail.py
+@@ -0,0 +1,80 @@
++import json
++
++from analyzer import synthetic as S
++from analyzer.iam_graph import build_graph
++from collector.cloudtrail import (annotate_graph, caller_arn, cloudtrail_findings, load_events, summarize_usage)
++
++A = S.ACCT
++
++
++def ev(name, who, t="2026-10-30T10:00:00Z", role=None, err=None, extra=None, resp=None, ip="1.1.1.1"):
++    e = {"eventTime": t, "eventName": name, "userIdentity": who, "sourceIPAddress": ip}
++    if role:
++        e["requestParameters"] = {"roleArn": role}
++    if err:
++        e["errorCode"] = err
++    if extra:
++        e["additionalEventData"] = extra
++    if resp:
++        e["responseElements"] = resp
++    return e
++
++
++BOB = {"type": "IAMUser", "arn": S.arn_user("bob")}
++G = build_graph(S.env([S.user("bob", [S.assume("r1")]), S.role("r1", S.trust([("AWS", S.arn_user("bob"))])),
++                       S.role("r2", S.trust([("AWS", S.arn_user("bob"))])), S.user("eve")], [S.bucket("b")]))
++
++
++def test_caller_arn_mapping():
++    assert caller_arn(BOB) == S.arn_user("bob")
++    assert caller_arn({"type": "AssumedRole", "arn": f"arn:aws:sts::{A}:assumed-role/Dev/sess"}) == S.arn_role("Dev")
++    assert caller_arn({"type": "AWSService", "invokedBy": "lambda.amazonaws.com"}) == "service:lambda.amazonaws.com"
++    assert caller_arn({"type": "Root"}) == "root"
++    assert caller_arn({"type": "Unknown"}) is None
++
++
++def test_usage_counts_success_and_failures_separately():
++    u = summarize_usage([ev("AssumeRole", BOB, role=S.arn_role("r1")),
++                         ev("AssumeRole", BOB, role=S.arn_role("r1"), t="2026-10-31T10:00:00Z"),
++                         ev("AssumeRole", BOB, role=S.arn_role("r2"), err="AccessDenied")])
++    assert u["assume"][(S.arn_user("bob"), S.arn_role("r1"))]["count"] == 2
++    assert (S.arn_user("bob"), S.arn_role("r2")) in u["failed_assume"]
++    assert u["window"]["days"] == 2
++
++
++def test_unused_and_unexpected_edges():
++    u = summarize_usage([ev("AssumeRole", BOB, role=S.arn_role("r1")),
++                         ev("AssumeRole", {"type": "IAMUser", "arn": S.arn_user("eve")}, role=S.arn_role("r1"))])
++    link = annotate_graph(G, u)
++    assert (S.arn_user("bob"), S.arn_role("r2")) in link["unused"]            # permitted, never used
++    assert [(a, b) for a, b, _ in link["unexpected"]] == [(S.arn_user("eve"), S.arn_role("r1"))]
++
++
++def test_findings_for_probing_console_without_mfa_and_root():
++    events = [ev("AssumeRole", BOB, role=S.arn_role("r2"), err="AccessDenied") for _ in range(3)]
++    events += [ev("ConsoleLogin", BOB, extra={"MFAUsed": "No"}, resp={"ConsoleLogin": "Success"}),
++               ev("ConsoleLogin", BOB, extra={"MFAUsed": "Yes"}, resp={"ConsoleLogin": "Success"}),
++               ev("ConsoleLogin", BOB, extra={"MFAUsed": "No"}, resp={"ConsoleLogin": "Failure"}),
++               ev("DescribeInstances", {"type": "Root"})]
++    u = summarize_usage(events)
++    rules = [f["rule"] for f in cloudtrail_findings(G, u, annotate_graph(G, u))]
++    assert rules.count("CT_FAILED_ASSUME") == 1 and rules.count("CT_CONSOLE_NO_MFA") == 1   # only the successful no-MFA
++    assert "CT_ROOT_USAGE" in rules
++
++
++def test_few_failures_below_threshold_are_ignored():
++    u = summarize_usage([ev("AssumeRole", BOB, role=S.arn_role("r2"), err="AccessDenied")])
++    assert "CT_FAILED_ASSUME" not in [f["rule"] for f in cloudtrail_findings(G, u, annotate_graph(G, u))]
++
++
++def test_load_events_accepts_records_wrapper_and_plain_list(tmp_path):
++    e = [ev("AssumeRole", BOB, role=S.arn_role("r1"))]
++    a, b = tmp_path / "a.json", tmp_path / "b.json"
++    a.write_text(json.dumps({"Records": e}))
++    b.write_text(json.dumps(e))
++    assert load_events(str(a)) == load_events(str(b)) == e
++
++
++def test_empty_events_do_not_crash():
++    u = summarize_usage([])
++    assert u["window"]["days"] == 0 and cloudtrail_findings(G, u, annotate_graph(G, u)) != []  # all edges unused
+diff --git a/tests/test_iam_graph.py b/tests/test_iam_graph.py
+new file mode 100644
+index 0000000..2df18c3
+--- /dev/null
++++ b/tests/test_iam_graph.py
+@@ -0,0 +1,161 @@
++import pytest
++
++from analyzer import synthetic as S
++from analyzer.iam_graph import (ALLOWED, CONDITIONAL, DENIED, build_graph, detect_role_chains, evaluate,
++                                find_access_paths, privilege_level, verify_multihop)
++
++B = "data"
++BA = S.arn_bucket(B)
++
++
++def graph(identities, buckets=None):
++    return build_graph(S.env(identities, buckets or [S.bucket(B)]))
++
++
++# ------------------------------------------------------------- evaluate()
++def test_allow_and_implicit_deny():
++    u = S.user("u", [S.s3_rw(B)])
++    assert evaluate(u, "s3:GetObject", BA + "/k")["decision"] == ALLOWED
++    assert evaluate(u, "s3:DeleteObject", BA + "/k")["decision"] == DENIED
++    assert evaluate(u, "s3:GetObject", S.arn_bucket("other") + "/k")["decision"] == DENIED
++
++
++def test_explicit_deny_overrides_allow():
++    u = S.user("u", [S.s3_rw(B), S.pol("Deny", "s3:GetObject", "*", effect="Deny")])
++    assert evaluate(u, "s3:GetObject", BA + "/k")["decision"] == DENIED
++
++
++def test_condition_makes_allow_conditional():
++    u = S.user("u", [S.pol("P", "s3:GetObject", "*", condition={"IpAddress": {"aws:SourceIp": "1.2.3.4/32"}})])
++    assert evaluate(u, "s3:GetObject", BA + "/k")["decision"] == CONDITIONAL
++
++
++def test_conditional_deny_downgrades_allow():
++    u = S.user("u", [S.s3_rw(B), S.pol("D", "s3:*", "*", effect="Deny", condition={"Bool": {"aws:SecureTransport": "false"}})])
++    assert evaluate(u, "s3:GetObject", BA + "/k")["decision"] == CONDITIONAL
++
++
++def test_notaction_and_notresource():
++    u = S.user("u", [S.pol("NA", None, "*", not_action=["iam:*"])])
++    assert evaluate(u, "s3:GetObject", BA)["decision"] == ALLOWED
++    assert evaluate(u, "iam:CreateUser", "*")["decision"] == DENIED
++    u2 = S.user("u2", [S.pol("NR", "s3:*", None, not_resource=[BA + "/*"])])
++    assert evaluate(u2, "s3:GetObject", BA + "/k")["decision"] == DENIED
++    assert evaluate(u2, "s3:GetObject", S.arn_bucket("zzz") + "/k")["decision"] == ALLOWED
++
++
++def test_privilege_levels():
++    assert privilege_level(S.user("a", [S.ADMIN])) == 3
++    assert privilege_level(S.user("b", [S.pol("I", "iam:AttachRolePolicy", "*")])) == 2
++    assert privilege_level(S.user("c", [S.pol("R", "s3:GetObject", "*")])) == 1
++    assert privilege_level(S.user("d")) == 0
++
++
++# ------------------------------------------------------------ assume edges
++def test_explicit_same_account_trust_needs_no_caller_policy():
++    G = graph([S.user("alice"), S.role("r", S.trust([("AWS", S.arn_user("alice"))]), [S.s3_rw(B)])])
++    assert G.has_edge(S.arn_user("alice"), S.arn_role("r"))
++
++
++def test_account_root_trust_requires_caller_allow():
++    t = S.trust([("AWS", f"arn:aws:iam::{S.ACCT}:root")])
++    no = graph([S.user("alice"), S.role("r", t)])
++    yes = graph([S.user("alice", [S.assume("r")]), S.role("r", t)])
++    assert not no.has_edge(S.arn_user("alice"), S.arn_role("r"))
++    assert yes.has_edge(S.arn_user("alice"), S.arn_role("r"))
++
++
++def test_caller_explicit_deny_blocks_root_trust_edge():
++    t = S.trust([("AWS", f"arn:aws:iam::{S.ACCT}:root")])
++    a = S.user("alice", [S.assume("r"), S.pol("D", "sts:AssumeRole", "*", effect="Deny")])
++    assert not graph([a, S.role("r", t)]).has_edge(S.arn_user("alice"), S.arn_role("r"))
++
++
++def test_external_service_and_public_principals():
++    G = graph([S.role("ext", S.trust([("AWS", "arn:aws:iam::999999999999:root")])),
++               S.role("svc", S.trust([("Service", "lambda.amazonaws.com")])),
++               S.role("pub", S.trust([("AWS", "*")]))])
++    assert G.has_edge("external-account:999999999999", S.arn_role("ext"))
++    assert G.has_edge("service:lambda.amazonaws.com", S.arn_role("svc"))
++    assert G.has_edge("public:*", S.arn_role("pub"))
++    assert G.nodes["public:*"]["external"] and G.nodes["external-account:999999999999"]["external"]
++
++
++def test_trust_condition_marks_edge_conditional():
++    t = S.trust([("AWS", S.arn_user("alice"))], condition={"Bool": {"aws:MultiFactorAuthPresent": "true"}})
++    G = graph([S.user("alice"), S.role("r", t, [S.s3_rw(B)])])
++    e = next(iter(G.get_edge_data(S.arn_user("alice"), S.arn_role("r")).values()))
++    assert e["conditional"] and e["condition_keys"] == ["aws:MultiFactorAuthPresent"]
++    v = verify_multihop(G, S.arn_user("alice"), BA, action="s3:GetObject")
++    assert v["status"] == "inconclusive" and v["unresolved"]
++
++
++# ------------------------------------------------------------- multi-hop
++def chain_env(n):
++    ids = [S.user("alice", [S.assume("c1")])]
++    for i in range(1, n + 1):
++        prev = S.arn_user("alice") if i == 1 else S.arn_role(f"c{i-1}")
++        pols = [S.assume(f"c{i+1}")] if i < n else [S.s3_rw(B)]
++        ids.append(S.role(f"c{i}", S.trust([("AWS", prev)]), pols))
++    return graph(ids)
++
++
++def test_multihop_reaches_bucket_and_reports_path():
++    G = chain_env(3)
++    v = verify_multihop(G, S.arn_user("alice"), BA, action="s3:GetObject")
++    assert v["status"] == "allowed" and v["hops"] == 3
++    assert v["path"] == ["alice", "c1", "c2", "c3"]
++
++
++def test_hop_limit_blocks():
++    assert verify_multihop(chain_env(3), S.arn_user("alice"), BA, max_hops=2)["status"] == "blocked"
++
++
++def test_action_not_granted_is_blocked():
++    v = verify_multihop(chain_env(2), S.arn_user("alice"), BA, action="s3:PutBucketPolicy")
++    assert v["status"] == "blocked"
++
++
++def test_via_constrains_to_role():
++    G = chain_env(2)
++    assert verify_multihop(G, S.arn_user("alice"), BA, via=S.arn_role("c2"))["status"] == "allowed"
++    assert verify_multihop(G, S.arn_user("alice"), BA, via=S.arn_role("nope"))["status"] == "blocked"
++
++
++def test_cycle_terminates_and_is_reported():
++    ids = [S.role("a", S.trust([("AWS", S.arn_role("b"))]), [S.assume("b")]),
++           S.role("b", S.trust([("AWS", S.arn_role("a"))]), [S.assume("a")])]
++    G = graph(ids)
++    assert find_access_paths(G) == []                       # terminates
++    assert any(f["rule"] == "ROLE_CYCLE" for f in detect_role_chains(G))
++
++
++# ---------------------------------------------------------- bucket policy
++def test_public_bucket_policy_creates_public_edge_unless_blocked():
++    pol_ = S.bucket_pol("s3:GetObject", "*", B)
++    G = graph([], [S.bucket(B, policy=pol_)])
++    assert G.has_edge("public:*", BA)
++    blocked = graph([], [S.bucket(B, policy=pol_, pab={"BlockPublicPolicy": True, "RestrictPublicBuckets": True})])
++    assert not blocked.has_node("public:*") or not blocked.has_edge("public:*", BA)
++
++
++# ------------------------------------------------------------ role chains
++def test_chain_from_external_to_admin_is_critical():
++    ids = [S.role("entry", S.trust([("AWS", "arn:aws:iam::999999999999:root")]), [S.assume("mid")]),
++           S.role("mid", S.trust([("AWS", S.arn_role("entry"))]), [S.assume("root-ish")]),
++           S.role("root-ish", S.trust([("AWS", S.arn_role("mid"))]), [S.ADMIN])]
++    fs = detect_role_chains(graph(ids))
++    assert fs and fs[0]["severity"] == "critical" and fs[0]["rule"] == "ROLE_CHAIN"
++
++
++def test_escalation_chain_from_limited_user_is_high_and_subchains_deduped():
++    ids = [S.user("bob", [S.assume("dev")]),
++           S.role("dev", S.trust([("AWS", S.arn_user("bob"))]), [S.assume("adm")]),
++           S.role("adm", S.trust([("AWS", S.arn_role("dev"))]), [S.ADMIN])]
++    fs = [f for f in detect_role_chains(graph(ids)) if f["rule"] == "ROLE_CHAIN"]
++    assert len(fs) == 1 and fs[0]["severity"] == "high" and fs[0]["evidence"]["hops"] == 2
++
++
++def test_single_hop_is_not_a_chain():
++    ids = [S.user("bob", [S.assume("r")]), S.role("r", S.trust([("AWS", S.arn_user("bob"))]), [S.ADMIN])]
++    assert detect_role_chains(graph(ids)) == []
+diff --git a/tests/test_schema_classifier.py b/tests/test_schema_classifier.py
+new file mode 100644
+index 0000000..b2c784d
+--- /dev/null
++++ b/tests/test_schema_classifier.py
+@@ -0,0 +1,51 @@
++import json
++
++from analyzer import synthetic as S
++from analyzer.schema import normalize_data
++from collector.classifier import classify_identities
++
++
++def test_legacy_schema_is_normalised():
++    legacy = {"identities": [
++        {"name": "r", "arn": S.arn_role("r"), "kind": "role", "type": "unknown", "path": "/",
++         "trust_policy": {"Statement": []},
++         "policies": [{"name": "m", "type": "managed", "document": {}}, {"name": "i", "type": "inline", "document": {}},
++                      {"name": "ERROR", "type": "error", "document": {}}]},
++        {"name": "u", "arn": S.arn_user("u"), "kind": "user", "type": "human", "access_key_count": 2}],
++        "resources": [{"name": "b", "type": "s3"}]}
++    n = normalize_data(legacy)
++    r, u = n["identities"]
++    assert r["type"] == "role" and u["type"] == "user"
++    assert [p["name"] for p in r["attached_policies"]] == ["m"] and [p["name"] for p in r["inline_policies"]] == ["i"]
++    assert len(u["access_keys"]) == 2
++    assert n["resources"][0]["type"] == "s3_bucket" and n["resources"][0]["arn"] == "arn:aws:s3:::b"
++
++
++def test_canonical_schema_is_idempotent():
++    d = json.load(open("data/sample_data.json"))
++    once = normalize_data(d)
++    assert normalize_data(once) == once
++
++
++def cat(identity):
++    return classify_identities([identity])[0]["classification"]["category"]
++
++
++def test_classifier_never_overwrites_type():
++    u = S.user("alice.smith", console=True, mfa=True)
++    assert classify_identities([u])[0]["type"] == "user"
++
++
++def test_classifier_categories():
++    assert cat(S.user("alice.smith", console=True, mfa=True)) == "human"
++    assert cat(S.user("svc-backup", tags={"Type": "service"}, keys=1)) == "non_human"
++    assert cat(S.role("fn", S.trust([("Service", "lambda.amazonaws.com")]))) == "non_human"
++    assert cat(S.role("AWSReservedSSO_Admin_x", S.trust([("Federated", "arn:aws:iam::1:saml-provider/AWSSSO_x")]),
++                      path="/aws-reserved/sso.amazonaws.com/")) == "human"
++
++
++def test_ambiguous_identities_are_uncertain_not_guessed():
++    assert cat(S.user("legacy-user-01", keys=1)) == "uncertain"          # keys only, weak signal
++    assert cat(S.role("x", S.trust([("AWS", "arn:aws:iam::1:root")]))) == "uncertain"
++    c = classify_identities([S.user("legacy-user-01", keys=1)])[0]["classification"]
++    assert c["needs_review"] and c["signals"]
