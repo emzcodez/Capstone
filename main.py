@@ -9,6 +9,8 @@ import logging
 from collections import Counter
 from pathlib import Path
 
+from analyzer.policy_utils import trust_principals
+
 log = logging.getLogger("analyzer")
 SAMPLE_PATH = Path(__file__).parent / "data" / "sample_data.json"
 SEVERITIES = ["critical", "high", "medium", "low"]
@@ -25,16 +27,15 @@ def load_sample():
 def select_paths(data):
     """Yield (role, principal, bucket, action): every trusted principal x S3 bucket."""
     n = 0
-    buckets = [r for r in data.get("resources", []) if r.get("type") == "s3"]
+    buckets = [r for r in data.get("resources", []) if r.get("type") in ("s3", "s3_bucket")]
     for ident in data.get("identities", []):
-        if ident.get("kind", "role") != "role":
+        if (ident.get("type") or ident.get("kind")) != "role":
             continue
         principals = []
         for st in (ident.get("trust_policy") or {}).get("Statement", []):
             if st.get("Effect") != "Allow":
                 continue
-            from analyzer.policy_utils import trust_principals
-            principals += [v for _, v in trust_principals(st)]
+            principals += [(k, v) for k, v in trust_principals(st)]
         for pr in dict.fromkeys(principals):
             for b in buckets:
                 for act in TEST_ACTIONS:
@@ -44,7 +45,39 @@ def select_paths(data):
                     yield ident, pr, b, act
 
 
-def run_analysis(use_sample=False, profile=None, use_simulator=False):
+def load_cloudtrail(cloudtrail, source, profile, days):
+    """cloudtrail: None | path to CloudTrail JSON | 'live' (LookupEvents, AWS source only)."""
+    if not cloudtrail:
+        return []
+    from collector.cloudtrail import fetch_cloudtrail_events, load_events
+    if cloudtrail == "live":
+        if source != "aws":
+            return []
+        import boto3
+        return fetch_cloudtrail_events(boto3.Session(profile_name=profile), days)
+    return load_events(cloudtrail)
+
+
+def offline_verifications(G, data):
+    """Graph-based (offline) verification: every direct trusted principal x bucket x TEST_ACTIONS,
+    following multi-hop assume chains. Conclusive without the IAM Policy Simulator."""
+    from analyzer.iam_graph import verify_multihop
+    out = []
+    buckets = [n for n, d in G.nodes(data=True) if d.get("kind") == "s3_bucket"]
+    for role in [n for n, d in G.nodes(data=True) if d.get("kind") == "role"]:
+        srcs = {u for u, _, d in G.in_edges(role, data=True) if d.get("etype") == "assume"}
+        for src in sorted(srcs):
+            for b in buckets:
+                for act in TEST_ACTIONS:
+                    if len(out) >= MAX_PATHS:
+                        return out
+                    v = verify_multihop(G, src, b, action=act, via=role)
+                    v["role"] = role
+                    out.append(v)
+    return out
+
+
+def run_analysis(use_sample=False, profile=None, use_simulator=False, cloudtrail=None, ct_days=30):
     """Always returns a dict with identities, resources, findings, verifications, source, warnings."""
     warnings, source = [], "sample" if use_sample else "aws"
     try:
@@ -58,8 +91,8 @@ def run_analysis(use_sample=False, profile=None, use_simulator=False):
         warnings.append(f"AWS collection failed ({type(exc).__name__}: {exc}). Showing sample data instead.")
         data, source = load_sample(), "sample"
 
-    data.setdefault("identities", [])
-    data.setdefault("resources", [])
+    from analyzer.schema import normalize_data
+    data = normalize_data(data)
 
     try:
         from collector.classifier import classify_identities
@@ -67,7 +100,7 @@ def run_analysis(use_sample=False, profile=None, use_simulator=False):
     except Exception as exc:
         warnings.append(f"Classification failed: {exc}")
 
-    findings, verifications = [], []
+    findings, verifications, graph, paths = [], [], None, []
     try:
         from analyzer.risk_detector import detect_risks
         findings = detect_risks(data)
@@ -75,25 +108,70 @@ def run_analysis(use_sample=False, profile=None, use_simulator=False):
         log.exception("Risk detection failed")
         warnings.append(f"Risk detection failed: {exc}")
 
+    from analyzer.remediation import enrich_findings
+    findings = enrich_findings(findings, data["identities"])
+
+    G = None
+    try:
+        from analyzer.iam_graph import build_graph, detect_role_chains, find_access_paths, graph_to_dict
+        G = build_graph(data)
+        paths = sorted(find_access_paths(G), key=lambda p: (-p["hops"], p["source_label"]))[:300]
+        findings = findings + detect_role_chains(G)
+        graph = graph_to_dict(G)
+    except Exception as exc:
+        log.exception("Graph analysis failed")
+        warnings.append(f"Graph analysis failed: {exc}")
+
     try:
         from analyzer.access_verifier import verify_access
-        session = None
+        iam_client = None
         if use_simulator and source == "aws":
             import boto3
-            session = boto3.Session(profile_name=profile)
-        for ident, principal, bucket, action in select_paths(data):
-            try:
-                verifications.append(verify_access(ident, principal, bucket, action=action,
-                                                   use_simulator=use_simulator and source == "aws",
-                                                   session=session))
-            except TypeError:  # teammate's verify_access has the 3-arg signature
-                verifications.append(verify_access(ident, principal, bucket))
+            iam_client = boto3.Session(profile_name=profile).client("iam")
+        if not (use_simulator and source == "aws") and G is not None:
+            verifications = offline_verifications(G, data)
+        else:
+            for ident, (kind, value), bucket, action in select_paths(data):
+                resource = bucket.get("arn") or f"arn:aws:s3:::{bucket['name']}"
+                if action.startswith(("s3:GetObject", "s3:PutObject")):
+                    resource += "/*"
+                verifications.append(verify_access(ident, {"type": kind, "value": value}, resource,
+                                                   action=action, iam_client=iam_client))
     except Exception as exc:
         log.exception("Verification failed")
         warnings.append(f"Access verification failed: {exc}")
 
+    usage, anomalies = None, []
+    if G is not None:
+        try:
+            from analyzer.anomaly import anomaly_findings, detect_anomalies
+            anomalies = detect_anomalies(G)
+            findings += anomaly_findings(G, anomalies)
+        except Exception as exc:
+            log.exception("Anomaly detection failed")
+            warnings.append(f"Anomaly detection failed: {exc}")
+        try:
+            events = load_cloudtrail(cloudtrail, source, profile, ct_days)
+            if events:
+                from collector.cloudtrail import annotate_graph, cloudtrail_findings, summarize_usage
+                usage = summarize_usage(events)
+                findings += cloudtrail_findings(G, usage, annotate_graph(G, usage))
+                graph = graph_to_dict(G)
+        except Exception as exc:
+            log.exception("CloudTrail integration failed")
+            warnings.append(f"CloudTrail integration failed: {exc}")
+        try:
+            from analyzer.scoring import score_findings
+            findings = score_findings(findings, data, G, usage, anomalies)
+        except Exception as exc:
+            log.exception("Scoring failed")
+            warnings.append(f"Risk scoring failed: {exc}")
+
+    for n, f in enumerate(findings, 1):
+        f.setdefault("id", f"F-{n:03d}")
     return {"identities": data["identities"], "resources": data["resources"],
-            "findings": findings, "verifications": verifications,
+            "findings": findings, "verifications": verifications, "graph": graph, "paths": paths,
+            "anomalies": anomalies, "cloudtrail": bool(usage),
             "source": source, "warnings": warnings}
 
 def summarize(R):
@@ -152,8 +230,11 @@ if __name__ == "__main__":
     ap.add_argument("--sample", action="store_true")
     ap.add_argument("--profile")
     ap.add_argument("--simulator", action="store_true")
+    ap.add_argument("--cloudtrail", help="CloudTrail JSON file, or 'live' to query AWS")
+    ap.add_argument("--days", type=int, default=30)
     a = ap.parse_args()
-    res = run_analysis(use_sample=a.sample, profile=a.profile, use_simulator=a.simulator)
+    res = run_analysis(use_sample=a.sample, profile=a.profile, use_simulator=a.simulator,
+                       cloudtrail=a.cloudtrail, ct_days=a.days)
     print(json.dumps(summarize(res), indent=2))
     for w in res["warnings"]:
         print("WARNING:", w)

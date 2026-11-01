@@ -1,0 +1,534 @@
+{
+  "Records": [
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-17T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-18T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-19T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-20T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-21T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-22T09:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "AssumedRole",
+        "arn": "arn:aws:sts::123456789012:assumed-role/DevRole/session1"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DataAdminRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-22T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-23T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-24T07:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "lambda.amazonaws.com",
+      "userIdentity": {
+        "type": "AWSService",
+        "invokedBy": "lambda.amazonaws.com"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-24T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-25T07:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "lambda.amazonaws.com",
+      "userIdentity": {
+        "type": "AWSService",
+        "invokedBy": "lambda.amazonaws.com"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-25T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-25T12:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "ConsoleLogin",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/alice.smith",
+        "userName": "alice.smith"
+      },
+      "additionalEventData": {
+        "MFAUsed": "Yes"
+      },
+      "responseElements": {
+        "ConsoleLogin": "Success"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-26T07:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "lambda.amazonaws.com",
+      "userIdentity": {
+        "type": "AWSService",
+        "invokedBy": "lambda.amazonaws.com"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-26T09:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "AssumedRole",
+        "arn": "arn:aws:sts::123456789012:assumed-role/DevRole/session1"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DataAdminRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-26T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-27T07:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "lambda.amazonaws.com",
+      "userIdentity": {
+        "type": "AWSService",
+        "invokedBy": "lambda.amazonaws.com"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-27T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-27T12:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "ConsoleLogin",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "additionalEventData": {
+        "MFAUsed": "No"
+      },
+      "responseElements": {
+        "ConsoleLogin": "Success"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-28T07:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "lambda.amazonaws.com",
+      "userIdentity": {
+        "type": "AWSService",
+        "invokedBy": "lambda.amazonaws.com"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-28T10:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "198.51.100.77",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/svc-backup",
+        "userName": "svc-backup"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DataAdminRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-28T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-29T07:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "lambda.amazonaws.com",
+      "userIdentity": {
+        "type": "AWSService",
+        "invokedBy": "lambda.amazonaws.com"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-29T09:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "AssumedRole",
+        "arn": "arn:aws:sts::123456789012:assumed-role/DevRole/session1"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DataAdminRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-29T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-30T07:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "lambda.amazonaws.com",
+      "userIdentity": {
+        "type": "AWSService",
+        "invokedBy": "lambda.amazonaws.com"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/lambda-etl-role"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-30T07:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "198.51.100.77",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/svc-backup",
+        "userName": "svc-backup"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
+      },
+      "errorCode": "AccessDenied"
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-30T08:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "198.51.100.77",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/svc-backup",
+        "userName": "svc-backup"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
+      },
+      "errorCode": "AccessDenied"
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-30T09:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "198.51.100.77",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/svc-backup",
+        "userName": "svc-backup"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
+      },
+      "errorCode": "AccessDenied"
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-30T10:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "198.51.100.77",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/svc-backup",
+        "userName": "svc-backup"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
+      },
+      "errorCode": "AccessDenied"
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-30T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "203.0.113.10",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/bob.jones",
+        "userName": "bob.jones"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/DevRole"
+      }
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-30T11:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "198.51.100.77",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/svc-backup",
+        "userName": "svc-backup"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
+      },
+      "errorCode": "AccessDenied"
+    },
+    {
+      "eventVersion": "1.08",
+      "eventTime": "2026-10-30T12:00:00Z",
+      "eventSource": "sts.amazonaws.com",
+      "eventName": "AssumeRole",
+      "awsRegion": "us-east-1",
+      "sourceIPAddress": "198.51.100.77",
+      "userIdentity": {
+        "type": "IAMUser",
+        "arn": "arn:aws:iam::123456789012:user/svc-backup",
+        "userName": "svc-backup"
+      },
+      "requestParameters": {
+        "roleArn": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
+      },
+      "errorCode": "AccessDenied"
+    }
+  ]
+}

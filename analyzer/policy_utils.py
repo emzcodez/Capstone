@@ -13,7 +13,9 @@ def statements(doc):
 
 def identity_statements(identity):
     """Yield (policy_name, statement) for every statement attached to an identity."""
-    for pol in identity.get("policies", []):
+    pols = (identity.get("attached_policies") or []) + (identity.get("inline_policies") or []) \
+        + (identity.get("group_policies") or []) + (identity.get("policies") or [])
+    for pol in pols:
         for st in statements(pol.get("document")):
             yield pol.get("name", "?"), st
 

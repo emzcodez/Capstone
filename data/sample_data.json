@@ -407,6 +407,246 @@
         ],
         "needs_review": true
       }
+    },
+    {
+      "id": "arn:aws:iam::123456789012:role/DevRole",
+      "arn": "arn:aws:iam::123456789012:role/DevRole",
+      "name": "DevRole",
+      "type": "role",
+      "path": "/",
+      "created": "2025-06-01T00:00:00+00:00",
+      "last_used": "2026-09-20T10:00:00+00:00",
+      "tags": {},
+      "max_session_duration": 3600,
+      "attached_policies": [
+        {
+          "name": "DevAssume",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "sts:AssumeRole",
+                "Resource": "arn:aws:iam::123456789012:role/DataAdminRole"
+              }
+            ]
+          }
+        },
+        {
+          "name": "LogsRead",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:GetObject",
+                  "s3:ListBucket"
+                ],
+                "Resource": [
+                  "arn:aws:s3:::internal-logs",
+                  "arn:aws:s3:::internal-logs/*"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "inline_policies": [],
+      "group_policies": [],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::123456789012:user/bob.jones"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      }
+    },
+    {
+      "id": "arn:aws:iam::123456789012:role/DataAdminRole",
+      "arn": "arn:aws:iam::123456789012:role/DataAdminRole",
+      "name": "DataAdminRole",
+      "type": "role",
+      "path": "/",
+      "created": "2025-06-01T00:00:00+00:00",
+      "last_used": "2026-09-20T10:00:00+00:00",
+      "tags": {},
+      "max_session_duration": 3600,
+      "attached_policies": [
+        {
+          "name": "DataAdmin",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": [
+                  "s3:*",
+                  "iam:AttachRolePolicy"
+                ],
+                "Resource": [
+                  "arn:aws:s3:::prod-customer-data",
+                  "arn:aws:s3:::prod-customer-data/*",
+                  "*"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "AssumeBreakGlass",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "sts:AssumeRole",
+                "Resource": "arn:aws:iam::123456789012:role/BreakGlassAdmin"
+              }
+            ]
+          }
+        }
+      ],
+      "inline_policies": [],
+      "group_policies": [],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::123456789012:role/DevRole"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      }
+    },
+    {
+      "id": "arn:aws:iam::123456789012:role/BreakGlassAdmin",
+      "arn": "arn:aws:iam::123456789012:role/BreakGlassAdmin",
+      "name": "BreakGlassAdmin",
+      "type": "role",
+      "path": "/",
+      "created": "2025-06-01T00:00:00+00:00",
+      "last_used": "2026-09-20T10:00:00+00:00",
+      "tags": {},
+      "max_session_duration": 3600,
+      "attached_policies": [
+        {
+          "name": "AdministratorAccess",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "*",
+                "Resource": "*"
+              }
+            ]
+          },
+          "arn": "arn:aws:iam::aws:policy/AdministratorAccess"
+        }
+      ],
+      "inline_policies": [],
+      "group_policies": [],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::123456789012:role/DataAdminRole"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      }
+    },
+    {
+      "id": "arn:aws:iam::123456789012:role/RoleA",
+      "arn": "arn:aws:iam::123456789012:role/RoleA",
+      "name": "RoleA",
+      "type": "role",
+      "path": "/",
+      "created": "2025-06-01T00:00:00+00:00",
+      "last_used": "2026-09-20T10:00:00+00:00",
+      "tags": {},
+      "max_session_duration": 3600,
+      "attached_policies": [
+        {
+          "name": "AssumeB",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "sts:AssumeRole",
+                "Resource": "arn:aws:iam::123456789012:role/RoleB"
+              }
+            ]
+          }
+        }
+      ],
+      "inline_policies": [],
+      "group_policies": [],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::123456789012:role/RoleB"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      }
+    },
+    {
+      "id": "arn:aws:iam::123456789012:role/RoleB",
+      "arn": "arn:aws:iam::123456789012:role/RoleB",
+      "name": "RoleB",
+      "type": "role",
+      "path": "/",
+      "created": "2025-06-01T00:00:00+00:00",
+      "last_used": "2026-09-20T10:00:00+00:00",
+      "tags": {},
+      "max_session_duration": 3600,
+      "attached_policies": [
+        {
+          "name": "AssumeA",
+          "document": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "sts:AssumeRole",
+                "Resource": "arn:aws:iam::123456789012:role/RoleA"
+              }
+            ]
+          }
+        }
+      ],
+      "inline_policies": [],
+      "group_policies": [],
+      "trust_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::123456789012:role/RoleA"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      }
     }
   ],
   "resources": [
