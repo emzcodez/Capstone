@@ -1,4 +1,4 @@
-# Permission Analysis and Risk Detection (Member 2)
+# Permission Analysis and Risk Detection 
 
 ```
 iam_risk/
