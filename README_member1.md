@@ -1,4 +1,4 @@
-# Member 1 – AWS Data Collection & Identity Classification
+AWS Data Collection & Identity Classification
 
 ## How to run
 ```bash
