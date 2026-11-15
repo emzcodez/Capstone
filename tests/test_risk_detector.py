@@ -74,6 +74,35 @@ def test_action_levels():
     assert action_level("ec2:DescribeInstances") == "list"
 
 
+@pytest.mark.parametrize("action", [
+    "iam:GenerateCredentialReport",
+    "iam:GenerateServiceLastAccessedDetails",
+    "iam:SimulateCustomPolicy",
+    "iam:SimulatePrincipalPolicy",
+])
+def test_iam_readonly_analysis_actions_are_not_classified_as_writes(action):
+    assert action_level(action) == "read"
+
+
+def test_iam_readonly_managed_policy_does_not_create_high_write_scope_finding():
+    doc = {"Statement": [{
+        "Effect": "Allow",
+        "Action": [
+            "iam:GenerateCredentialReport",
+            "iam:GenerateServiceLastAccessedDetails",
+            "iam:Get*",
+            "iam:List*",
+            "iam:SimulateCustomPolicy",
+            "iam:SimulatePrincipalPolicy",
+        ],
+        "Resource": "*",
+    }]}
+    findings = by_rule(run(identity(doc)), "UNRESTRICTED_RESOURCE")
+    assert len(findings) == 1
+    assert findings[0]["risk"] == "Medium"
+    assert findings[0]["evidence"]["highest_action_level"] == "read"
+
+
 # ------------------------------------------------------- safe policies
 @pytest.mark.parametrize("name", ["safe_readonly_one_bucket", "safe_lambda_basic_logging"])
 def test_safe_permission_policies_produce_no_findings(name):
