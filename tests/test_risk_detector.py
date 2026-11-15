@@ -143,6 +143,27 @@ def test_read_on_star_is_medium_and_list_on_star_is_low():
     assert by_rule(run(identity(lst)), "UNRESTRICTED_RESOURCE")[0]["risk"] == "Low"
 
 
+@pytest.mark.parametrize("action", [
+    "iam:ListUsers",
+    "iam:ListRoles",
+    "iam:ListGroups",
+    "iam:ListPolicies",
+    "iam:ListAccountAliases",
+])
+def test_iam_account_enumeration_actions_do_not_create_resource_star_noise(action):
+    doc = {"Statement": [{"Effect": "Allow", "Action": action, "Resource": "*"}]}
+    assert by_rule(run(identity(doc)), "UNRESTRICTED_RESOURCE") == []
+
+
+def test_iam_get_user_on_star_is_not_blindly_suppressed():
+    # GetUser can expose user metadata and is intentionally not part of the
+    # account-enumeration allowlist.
+    doc = {"Statement": [{"Effect": "Allow", "Action": "iam:GetUser", "Resource": "*"}]}
+    findings = by_rule(run(identity(doc)), "UNRESTRICTED_RESOURCE")
+    assert len(findings) == 1
+    assert findings[0]["risk"] == "Medium"
+
+
 # ------------------------------------------------------ rule 3: trust
 def test_public_principal_trust_is_critical():
     f = by_rule(run(identity(trust=fx("risky_trust_public_principal"))), "TRUST_PUBLIC_PRINCIPAL")

@@ -104,11 +104,42 @@ def _collect_buckets(s3):
 
 
 def collect_aws_data(profile=None, region=None):
-    """Return {"identities": [...], "resources": [...]}. Raises on connection/auth failure."""
+    """
+    Collect AWS IAM and S3 data independently.
+
+    A failure in one service must not discard successfully
+    collected data from another service.
+    """
     if boto3 is None:
         raise RuntimeError("boto3 is not installed (pip install boto3)")
-    session = boto3.Session(profile_name=profile, region_name=region)
-    iam, s3 = session.client("iam"), session.client("s3")
-    iam.get_account_summary()  # fail fast if credentials are bad
-    return {"identities": _collect_users(iam) + _collect_roles(iam),
-            "resources": _collect_buckets(s3)}
+
+    session = boto3.Session(
+        profile_name=profile,
+        region_name=region
+    )
+
+    iam = session.client("iam")
+    s3 = session.client("s3")
+
+    # IAM is the essential collection component.
+    iam.get_account_summary()
+
+    identities = _collect_users(iam) + _collect_roles(iam)
+
+    resources = []
+    warnings = []
+
+    # S3 collection is independent of IAM collection.
+    try:
+        resources = _collect_buckets(s3)
+    except ClientError as exc:
+        warnings.append(
+            f"S3 collection unavailable: {exc.response['Error'].get('Message', str(exc))}"
+        )
+
+    return {
+        "identities": identities,
+        "resources": resources,
+        "warnings": warnings
+    }
+
