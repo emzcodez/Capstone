@@ -109,6 +109,17 @@ PERMISSION_ACTIONS = [
 ]
 
 
+# Explicit read-only analysis operations whose names do not begin with Get/List.
+# Keep this allowlist action-specific: a blanket Generate* or Simulate* exemption
+# could misclassify other services' state-changing operations.
+READ_ONLY_ANALYSIS_ACTIONS = {
+    "iam:generatecredentialreport",
+    "iam:generateservicelastaccesseddetails",
+    "iam:simulatecustompolicy",
+    "iam:simulateprincipalpolicy",
+}
+
+
 def action_level(action):
     """Classify an action (possibly containing wildcards) as
     list < read < write < permission < admin."""
@@ -118,6 +129,10 @@ def action_level(action):
     for pattern in PERMISSION_ACTIONS:
         if actions_overlap(pattern, action):
             return "permission"
+    # IAM report generation and policy simulation produce analysis results;
+    # they do not mutate IAM identities, credentials, policies, or trust.
+    if action.lower() in READ_ONLY_ANALYSIS_ACTIONS:
+        return "read"
     name = action.split(":", 1)[-1].lower()
     if name.startswith(("list", "describe")):
         return "list"
