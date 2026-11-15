@@ -54,9 +54,23 @@ FULL_CONTROL_SERVICES = {"iam", "organizations"}
 
 # Actions that legitimately need Resource "*" -> no unrestricted-resource noise.
 STAR_RESOURCE_ALLOWLIST = [
-    "s3:ListAllMyBuckets", "sts:GetCallerIdentity", "ec2:Describe*",
-    "iam:ListAccountAliases", "cloudwatch:PutMetricData", "logs:CreateLogGroup",
-    "logs:CreateLogStream", "logs:PutLogEvents", "xray:PutTraceSegments",
+    # AWS APIs that are designed to be called with Resource: "*".
+    # Keep this list deliberately explicit: do not exempt every Get*/List*
+    # action, because some read APIs expose sensitive data or support
+    # resource-level permissions.
+    "s3:ListAllMyBuckets",
+    "sts:GetCallerIdentity",
+    "ec2:Describe*",
+    "iam:ListAccountAliases",
+    "iam:ListUsers",
+    "iam:ListRoles",
+    "iam:ListGroups",
+    "iam:ListPolicies",
+    "cloudwatch:PutMetricData",
+    "logs:CreateLogGroup",
+    "logs:CreateLogStream",
+    "logs:PutLogEvents",
+    "xray:PutTraceSegments",
     "xray:PutTelemetryRecords",
 ]
 

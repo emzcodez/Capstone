@@ -92,6 +92,7 @@ def run_analysis(use_sample=False, profile=None, use_simulator=False, cloudtrail
         data, source = load_sample(), "sample"
 
     from analyzer.schema import normalize_data
+    warnings.extend(data.pop("warnings", []))
     data = normalize_data(data)
 
     try:
